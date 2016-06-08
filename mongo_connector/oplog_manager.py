@@ -374,6 +374,7 @@ class OplogThread(threading.Thread):
 
     def _pop_excluded_fields(self, doc):
         # Remove all the fields that were passed in exclude_fields.
+        doc = self.convert(doc)
         for field in self._exclude_fields:
             curr_doc = doc
             dots = field.split('.')
@@ -392,6 +393,7 @@ class OplogThread(threading.Thread):
 
     def _copy_included_fields(self, doc):
         # Copy over included fields to new doc
+        doc = self.convert(doc)
         new_doc = {}
         for field in self.fields:
             dots = field.split('.')
@@ -403,6 +405,21 @@ class OplogThread(threading.Thread):
                     curr_doc = curr_doc[part]
             else:
                 # If we found the field in the original document, copy it
+                edit_doc = new_doc
+                for part in dots[:-1]:
+                    edit_doc = edit_doc.setdefault(part, {})
+                edit_doc[dots[-1]] = curr_doc
+
+        return new_doc
+
+    def convert(self, doc):
+        new_doc = {}
+        for field in doc:
+            dots = field.split('.')
+            curr_doc = doc[field]
+            if len(dots) == 1:
+                new_doc[field] = curr_doc
+            else:
                 edit_doc = new_doc
                 for part in dots[:-1]:
                     edit_doc = edit_doc.setdefault(part, {})

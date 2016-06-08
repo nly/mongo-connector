@@ -73,7 +73,10 @@ class DocManagerBase(object):
                             where.extend([None] * (index + 1 - wl))
                         where[index] = value
                     else:
-                        doc[to_set] = value
+                        if isinstance(value, dict) and isinstance(doc[to_set], dict):
++                           doc[to_set] = dict(doc[to_set], **value)
++                       else:
++                           doc[to_set] = value
 
                 # $unset
                 for to_unset in update_spec.get("$unset", []):
