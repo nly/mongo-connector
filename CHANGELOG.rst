@@ -1,6 +1,31 @@
 Changelog
 =========
 
+Version 2.4.1
+-------------
+
+- Collection dump does not require namespace-set collection entries to be in the oplog.
+- Fix an issue where a rollback was misinterpreted as falling off the oplog.
+- Fix issue when re-raising exceptions containing unicode.
+
+Version 2.4
+-----------
+
+- Add --exclude-fields option.
+- Better handling of exceptions in doc managers.
+- Allow doc managers to be imported from anywhere, given the full path.
+- Do not call count() on oplog cursors.
+- Change the oplog format to be resilient to replica set failover.
+
+.. warning:: The change to the oplog timestamp file format means that downgrading
+             from this version is not possible!
+
+Version 2.3
+-----------
+
+- Make self._fields in OplogThread a set.
+- Move elastic doc managers into their own projects.
+
 Version 2.2
 -----------
 - Support for using a single meta collection to track replication to MongoDB cluster
@@ -52,7 +77,7 @@ Version 2.0.1
 Version 2.0.1 fixes filtering by namespace (--namespace-set, namespaces.include).
 
 Version 2.0
-----------------
+-----------
 
 Version 2.0 is a major version of Mongo Connector and includes breaking changes, new features, and bug fixes.
 

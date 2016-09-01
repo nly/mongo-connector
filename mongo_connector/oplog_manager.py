@@ -92,6 +92,8 @@ class OplogThread(threading.Thread):
         LOG.info('OplogThread: Initializing oplog thread')
 
         self.oplog = self.primary_client.local.oplog.rs
+        self.replset_name = (
+            self.primary_client.admin.command('ismaster')['setName'])
 
         if not self.oplog.find_one():
             err_msg = 'OplogThread: No oplog for thread:'
@@ -194,7 +196,7 @@ class OplogThread(threading.Thread):
         LOG.debug("OplogThread: Run thread started")
         while self.running is True:
             LOG.debug("OplogThread: Getting cursor")
-            cursor, cursor_len = self.init_cursor()
+            cursor, cursor_empty = self.init_cursor()
 
             # we've fallen too far behind
             if cursor is None and self.checkpoint is not None:
@@ -204,14 +206,11 @@ class OplogThread(threading.Thread):
                 self.running = False
                 continue
 
-            if cursor_len == 0:
+            if cursor_empty:
                 LOG.debug("OplogThread: Last entry is the one we "
                           "already processed.  Up to date.  Sleeping.")
                 time.sleep(1)
                 continue
-
-            LOG.debug("OplogThread: Got the cursor, count is %d"
-                      % cursor_len)
 
             last_ts = None
             remove_inc = 0
@@ -265,6 +264,13 @@ class OplogThread(threading.Thread):
                                 is_gridfs_file = True
                             else:
                                 continue
+
+                        # Ignore the collection if it is not included
+                        if self.oplog_ns_set and ns not in self.oplog_ns_set:
+                            LOG.debug("OplogThread: Skipping oplog entry: "
+                                      "'%s' is not in the namespace set." %
+                                      (ns,))
+                            continue
 
                         # use namespace mapping if one exists
                         ns = self.dest_mapping.get(ns, ns)
@@ -464,14 +470,12 @@ class OplogThread(threading.Thread):
         return entry
 
     def get_oplog_cursor(self, timestamp=None):
-        """Get a cursor to the oplog after the given timestamp, filtering
-        entries not in the namespace set.
+        """Get a cursor to the oplog after the given timestamp, excluding
+        no-op entries.
+
         If no timestamp is specified, returns a cursor to the entire oplog.
         """
-        query = {}
-        if self.oplog_ns_set:
-            query['ns'] = {'$in': self.oplog_ns_set}
-
+        query = {'op': {'$ne': 'n'}}
         if timestamp is None:
             cursor = self.oplog.find(
                 query,
@@ -654,24 +658,40 @@ class OplogThread(threading.Thread):
 
         return timestamp
 
-    def get_last_oplog_timestamp(self):
-        """Return the timestamp of the latest entry in the oplog.
+    def _get_oplog_timestamp(self, newest_entry):
+        """Return the timestamp of the latest or earliest entry in the oplog.
         """
-        if not self.oplog_ns_set:
-            curr = self.oplog.find().sort(
-                '$natural', pymongo.DESCENDING
-            ).limit(-1)
-        else:
-            curr = self.oplog.find(
-                {'ns': {'$in': self.oplog_ns_set}}
-            ).sort('$natural', pymongo.DESCENDING).limit(-1)
+        sort_order = pymongo.DESCENDING if newest_entry else pymongo.ASCENDING
+        curr = self.oplog.find({'op': {'$ne': 'n'}}).sort(
+            '$natural', sort_order
+        ).limit(-1)
 
-        if curr.count(with_limit_and_skip=True) == 0:
+        try:
+            ts = next(curr)['ts']
+        except StopIteration:
+            LOG.debug("OplogThread: oplog is empty.")
             return None
 
-        LOG.debug("OplogThread: Last oplog entry has timestamp %d."
-                  % curr[0]['ts'].time)
-        return curr[0]['ts']
+        LOG.debug("OplogThread: %s oplog entry has timestamp %d."
+                  % ('Newest' if newest_entry else 'Oldest', ts.time))
+        return ts
+
+    def get_oldest_oplog_timestamp(self):
+        """Return the timestamp of the oldest entry in the oplog.
+        """
+        return self._get_oplog_timestamp(False)
+
+    def get_last_oplog_timestamp(self):
+        """Return the timestamp of the newest entry in the oplog.
+        """
+        return self._get_oplog_timestamp(True)
+
+    def _cursor_empty(self, cursor):
+        try:
+            next(cursor.clone().limit(-1))
+            return False
+        except StopIteration:
+            return True
 
     def init_cursor(self):
         """Position the cursor appropriately.
@@ -679,7 +699,7 @@ class OplogThread(threading.Thread):
         The cursor is set to either the beginning of the oplog, or
         wherever it was last left off.
 
-        Returns the cursor and the number of documents left in the cursor.
+        Returns the cursor and True if the cursor is empty.
         """
         timestamp = self.read_last_checkpoint()
 
@@ -688,23 +708,23 @@ class OplogThread(threading.Thread):
                 # dump collection and update checkpoint
                 timestamp = self.dump_collection()
                 if timestamp is None:
-                    return None, 0
+                    return None, True
             else:
                 # Collection dump disabled:
                 # return cursor to beginning of oplog.
                 cursor = self.get_oplog_cursor()
                 self.checkpoint = self.get_last_oplog_timestamp()
                 self.update_checkpoint()
-                return cursor, retry_until_ok(cursor.count)
+                return cursor, retry_until_ok(self._cursor_empty, cursor)
 
         self.checkpoint = timestamp
         self.update_checkpoint()
 
         for i in range(60):
             cursor = self.get_oplog_cursor(timestamp)
-            cursor_len = retry_until_ok(cursor.count)
+            cursor_empty = retry_until_ok(self._cursor_empty, cursor)
 
-            if cursor_len == 0:
+            if cursor_empty:
                 # rollback, update checkpoint, and retry
                 LOG.debug("OplogThread: Initiating rollback from "
                           "get_oplog_cursor")
@@ -717,21 +737,33 @@ class OplogThread(threading.Thread):
                 first_oplog_entry = retry_until_ok(next, cursor)
             except StopIteration:
                 # It's possible for the cursor to become invalid
-                # between the cursor.count() call and now
+                # between the next(cursor) call and now
                 time.sleep(1)
                 continue
 
-            # first entry should be last oplog entry processed
-            cursor_ts_long = util.bson_ts_to_long(
-                first_oplog_entry.get("ts"))
-            given_ts_long = util.bson_ts_to_long(timestamp)
-            if cursor_ts_long > given_ts_long:
-                # first entry in oplog is beyond timestamp
-                # we've fallen behind
-                return None, 0
+            oldest_ts_long = util.bson_ts_to_long(
+                self.get_oldest_oplog_timestamp())
+            checkpoint_ts_long = util.bson_ts_to_long(timestamp)
+            if checkpoint_ts_long < oldest_ts_long:
+                # We've fallen behind, the checkpoint has fallen off the oplog
+                return None, True
+
+            cursor_ts_long = util.bson_ts_to_long(first_oplog_entry["ts"])
+            if cursor_ts_long > checkpoint_ts_long:
+                # The checkpoint is not present in this oplog and the oplog
+                # did not rollover. This means that we connected to a new
+                # primary which did not replicate the checkpoint and which has
+                # new changes in its oplog for us to process.
+                # rollback, update checkpoint, and retry
+                LOG.debug("OplogThread: Initiating rollback from "
+                          "get_oplog_cursor: new oplog entries found but "
+                          "checkpoint is not present")
+                self.checkpoint = self.rollback()
+                self.update_checkpoint()
+                return self.init_cursor()
 
             # first entry has been consumed
-            return cursor, cursor_len - 1
+            return cursor, cursor_empty
 
         else:
             raise errors.MongoConnectorError(
@@ -743,7 +775,13 @@ class OplogThread(threading.Thread):
         if self.checkpoint is not None:
             with self.oplog_progress as oplog_prog:
                 oplog_dict = oplog_prog.get_dict()
-                oplog_dict[str(self.oplog)] = self.checkpoint
+                # If we have the repr of our oplog collection in the dictionary,
+                # remove it and replace it with our replica set name.
+                # This allows an easy upgrade path from mongo-connector 2.3.
+                # For an explanation of the format change, see the comment in
+                # read_last_checkpoint.
+                oplog_dict.pop(str(self.oplog), None)
+                oplog_dict[self.replset_name] = self.checkpoint
                 LOG.debug("OplogThread: oplog checkpoint updated to %s" %
                           str(self.checkpoint))
         else:
@@ -752,13 +790,24 @@ class OplogThread(threading.Thread):
     def read_last_checkpoint(self):
         """Read the last checkpoint from the oplog progress dictionary.
         """
+        # In versions of mongo-connector 2.3 and before, we used the repr of the
+        # oplog collection as keys in the oplog_progress dictionary.
+        # In versions thereafter, we use the replica set name. For backwards
+        # compatibility, we check for both.
         oplog_str = str(self.oplog)
-        ret_val = None
 
+        ret_val = None
         with self.oplog_progress as oplog_prog:
             oplog_dict = oplog_prog.get_dict()
-            if oplog_str in oplog_dict.keys():
-                ret_val = oplog_dict[oplog_str]
+            try:
+                # New format.
+                ret_val = oplog_dict[self.replset_name]
+            except KeyError:
+                try:
+                    # Old format.
+                    ret_val = oplog_dict[oplog_str]
+                except KeyError:
+                    pass
 
         LOG.debug("OplogThread: reading last checkpoint as %s " %
                   str(ret_val))

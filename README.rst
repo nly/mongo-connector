@@ -1,12 +1,5 @@
 For complete documentation, check out the `Mongo Connector Wiki <https://github.com/10gen-labs/mongo-connector/wiki>`__.
 
-DISCLAIMER
-----------
-
-Please note: all tools/ scripts in this repo are released for use "AS IS" without any warranties of any kind, including, but not limited to their installation, use, or performance. We disclaim any and all warranties, either express or implied, including but not limited to any warranty of noninfringement, merchantability, and/ or fitness for a particular purpose. We do not warrant that the technology will meet your requirements, that the operation thereof will be uninterrupted or error-free, or that any errors will be corrected.
-Any use of these scripts and tools is at your own risk. There is no guarantee that they have been through thorough testing in a comparable environment and we are not responsible for any damage or data loss incurred with their use.
-You are responsible for reviewing and testing any scripts you run thoroughly before use in any non-testing environment.
-
 System Overview
 ---------------
 
@@ -14,7 +7,7 @@ System Overview
 target systems, such as Solr, Elasticsearch, or another MongoDB cluster.  It
 synchronizes data in MongoDB to the target then tails the MongoDB oplog, keeping
 up with operations in MongoDB in real-time. It has been tested with Python 2.6,
-2.7, 3.3, and 3.4. Detailed documentation is available on the `wiki
+2.7, and 3.3+. Detailed documentation is available on the `wiki
 <https://github.com/10gen-labs/mongo-connector/wiki>`__.
 
 Getting Started
