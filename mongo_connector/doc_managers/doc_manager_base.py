@@ -75,7 +75,7 @@ class DocManagerBase(object):
                     else:
                         if isinstance(value, dict) and isinstance(doc[to_set], dict):
                             doc[to_set] = dict(doc[to_set], **value)
-                       else:
+                        else:
                             doc[to_set] = value
 
                 # $unset
