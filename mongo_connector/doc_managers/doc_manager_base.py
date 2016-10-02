@@ -74,9 +74,9 @@ class DocManagerBase(object):
                         where[index] = value
                     else:
                         if isinstance(value, dict) and isinstance(doc[to_set], dict):
-+                           doc[to_set] = dict(doc[to_set], **value)
-+                       else:
-+                           doc[to_set] = value
+                            doc[to_set] = dict(doc[to_set], **value)
+                       else:
+                            doc[to_set] = value
 
                 # $unset
                 for to_unset in update_spec.get("$unset", []):
