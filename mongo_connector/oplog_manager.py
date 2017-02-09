@@ -409,7 +409,7 @@ class OplogThread(threading.Thread):
 
         return doc  # Need this to be similar to copy_included_fields.
 
-    def _copy_included_fields(self, doc):
+    def _copy_included_fields(self, doc, include_fields, update=False):
         # Copy over included fields to new doc
         doc = self.convert(doc)
         new_doc = {}
