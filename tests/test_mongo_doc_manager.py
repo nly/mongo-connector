@@ -19,6 +19,7 @@ import sys
 
 sys.path[0:0] = [""]
 
+from mongo_connector.namespace_config import NamespaceConfig
 from mongo_connector.command_helper import CommandHelper
 from mongo_connector.doc_managers.mongo_doc_manager import DocManager
 from mongo_connector.test_utils import TESTARGS, MockGridFSFile
@@ -36,7 +37,6 @@ class TestMongoDocManager(MongoTestCase):
     def setUpClass(cls):
         MongoTestCase.setUpClass()
         cls.namespaces_inc = ["test.test_include1", "test.test_include2"]
-        cls.namespaces_exc = ["test.test_exclude1", "test.test_exclude2"]
 
     def setUp(self):
         """Empty Mongo at the start of every test
@@ -44,24 +44,33 @@ class TestMongoDocManager(MongoTestCase):
 
         self.choosy_docman = DocManager(
             self.standalone.uri,
-            namespace_set=self.namespaces_inc,
             use_single_meta_collection=self.use_single_meta_collection)
 
         self.mongo_conn.drop_database("__mongo_connector")
         self._remove()
 
         conn = self.standalone.client()
-        for ns in self.namespaces_inc + self.namespaces_exc:
+        for ns in self.namespaces_inc:
             db, coll = ns.split('.', 1)
-            conn[db][coll].delete_many({})
+            conn[db][coll].drop()
 
-    def test_namespaces(self):
-        """Ensure that a DocManager instantiated with a namespace set
-        has the correct namespaces
+    def test_meta_collections(self):
+        """Ensure that a DocManager returns the correct set of meta collection
+        names.
         """
-
-        self.assertEqual(set(self.namespaces_inc),
-                         set(self.choosy_docman._namespaces()))
+        meta_collection_names = set()
+        if self.use_single_meta_collection:
+            meta_collection_names.add(self.choosy_docman.meta_collection_name)
+        # Before replication only the single meta_collection should be
+        # returned.
+        self.assertEqual(set(self.choosy_docman._meta_collections()),
+                         meta_collection_names)
+        for namespace in ["test.test", "foo.bar", "test.bar"]:
+            if not self.use_single_meta_collection:
+                meta_collection_names.add(namespace)
+            self.choosy_docman.upsert({"_id": "1"}, namespace, 1)
+            self.assertEqual(set(self.choosy_docman._meta_collections()),
+                             meta_collection_names)
 
     def test_update(self):
         doc_id = '1'
@@ -194,9 +203,6 @@ class TestMongoDocManager(MongoTestCase):
         for ns in self.namespaces_inc:
             for i in range(100):
                 self.choosy_docman.upsert({"_id": i}, ns, i)
-        for ns in self.namespaces_exc:
-            for i in range(100):
-                self.choosy_docman.upsert({"_id": -i}, ns, i)
 
         results = list(self.choosy_docman.search(0, 49))
         self.assertEqual(len(results), 100)
@@ -220,36 +226,17 @@ class TestMongoDocManager(MongoTestCase):
         doc = self.choosy_docman.get_last_doc()
         self.assertEqual(doc[self.id_field], '6')
 
-    def test_get_last_doc_namespaces(self):
-        """Ensure that get_last_doc returns the latest document in one of
-        the given namespaces
-        """
-
-        # latest document is not in included namespace
-        for i in range(100):
-            ns = (self.namespaces_inc, self.namespaces_exc)[i % 2][0]
-            self.choosy_docman.upsert({"_id": i}, ns, i)
-        last_doc = self.choosy_docman.get_last_doc()
-        # Even value for _id means ns was in self.namespaces_inc.
-        self.assertEqual(last_doc[self.id_field], 98)
-
-        # remove latest document so last doc is in included namespace,
-        # shouldn't change result
-        db, coll = self.namespaces_inc[0].split(".", 1)
-        self.standalone.client()[db][coll].delete_one({"_id": 99})
-        last_doc = self.choosy_docman.get_last_doc()
-        self.assertEqual(last_doc[self.id_field], 98)
-
     def test_commands(self):
         # Also test with namespace mapping.
         # Note that mongo-connector does not currently support commands after
         # renaming a database.
-        self.choosy_docman.command_helper = CommandHelper(
+        namespace_config = NamespaceConfig(
             namespace_set=['test.test', 'test.test2', 'test.drop'],
-            dest_mapping={
-                'test.test': 'test.othertest',
-                'test.drop': 'dropped.collection'
+            namespace_options={
+             'test.test': 'test.othertest',
+             'test.drop': 'dropped.collection'
             })
+        self.choosy_docman.command_helper = CommandHelper(namespace_config)
 
         try:
             self.choosy_docman.handle_command({'create': 'test'}, *TESTARGS)
@@ -268,9 +255,11 @@ class TestMongoDocManager(MongoTestCase):
             self.assertNotIn('test2',
                              self.mongo_conn['test'].collection_names())
 
-            # WiredTiger drops the database when the last collection is dropped.
+            # WiredTiger drops the database when the last collection is
+            # dropped.
             if 'test' not in self.mongo_conn.database_names():
-                self.choosy_docman.handle_command({'create': 'test'}, *TESTARGS)
+                self.choosy_docman.handle_command({'create': 'test'},
+                                                  *TESTARGS)
             self.assertIn('test', self.mongo_conn.database_names())
             self.choosy_docman.handle_command(
                 {'dropDatabase': 1}, 'test.$cmd', 1)

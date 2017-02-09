@@ -23,7 +23,7 @@ sys.path[0:0] = [""]
 from mongo_connector import config, errors, connector
 from mongo_connector.connector import get_config_options, setup_logging
 from mongo_connector.doc_managers import doc_manager_simulator
-from mongo_connector.test_utils import ReplicaSet
+
 from tests import unittest
 
 from_here = lambda *paths: os.path.join(
@@ -74,7 +74,8 @@ class TestConfig(unittest.TestCase):
             'logging': {
                 'type': u'file',
                 'filename': u'testFilename',
-                'format': u'%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s',
+                'format': u'%(asctime)s [%(levelname)s] %(name)s:%(lineno)d'
+                          u' - %(message)s',
                 'rotationWhen': u'midnight',
                 'rotationInterval': 1,
                 'rotationBackups': 7,
@@ -89,6 +90,7 @@ class TestConfig(unittest.TestCase):
             'fields': [u'testFields1', u'testField2'],
             'namespaces': {
                 'include': [u'testNamespaceSet'],
+                'exclude': [u'testExcludeNamespaceSet'],
                 'mapping': {'testMapKey': u'testMapValue'},
                 'gridfs': [u'testGridfsSet']
             }
@@ -109,6 +111,7 @@ class TestConfig(unittest.TestCase):
                 'passwordFile': 'testPasswordFile2'
             },
             'namespaces': {
+                'exclude': [],
                 'mapping': {}
             }
         }
@@ -116,7 +119,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(self.conf['logging'], {
             'type': u'syslog',
             'filename': u'testFilename',
-            'format': u'%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s',
+            'format': u'%(asctime)s [%(levelname)s] %(name)s:%(lineno)d'
+                      u' - %(message)s',
             'rotationWhen': u'midnight',
             'rotationInterval': 1,
             'rotationBackups': 7,
@@ -130,6 +134,7 @@ class TestConfig(unittest.TestCase):
         })
         self.assertEqual(self.conf['namespaces'], {
             'include': [u'testNamespaceSet'],
+            'exclude': [],
             'mapping': {},
             'gridfs': [u'testGridfsSet']
         })
@@ -149,7 +154,8 @@ class TestConfig(unittest.TestCase):
 
         self.load_options({'-w': 'logFile'})
         self.assertEqual(self.conf['logging.type'], 'file')
-        self.assertEqual(self.conf['logging.filename'], 'logFile')
+        self.assertEqual(self.conf['logging.filename'],
+                         os.path.abspath('logFile'))
 
         self.load_options({'-s': None,
                            '--syslog-host': 'testHost',
@@ -170,65 +176,124 @@ class TestConfig(unittest.TestCase):
     def test_namespace_set(self):
         # test namespace_set and dest_namespace_set
         self.load_options({
-            "-n": "source_ns_1,source_ns_2,source_ns_3",
-            "-g": "dest_ns_1,dest_ns_2,dest_ns_3"
+            "-n": "source_db_1.col,source_db_2.col,source_db_3.col",
+            "-g": "dest_db_1.col,dest_db_2.col,dest_db_3.col"
         })
         self.assertEqual(self.conf['namespaces.include'],
-                         ['source_ns_1', 'source_ns_2', 'source_ns_3'])
+                         ['source_db_1.col', 'source_db_2.col', 'source_db_3.col'])
         self.assertEqual(self.conf['namespaces.mapping'],
-                         {'source_ns_1': 'dest_ns_1',
-                          'source_ns_2': 'dest_ns_2',
-                          'source_ns_3': 'dest_ns_3'})
+                         {'source_db_1.col': 'dest_db_1.col',
+                          'source_db_2.col': 'dest_db_2.col',
+                          'source_db_3.col': 'dest_db_3.col'})
+
+        # test exclude_namespace_set
+        self.load_options({
+            "-x": "source_db_1.col,source_db_2.col,source_db_3.col"
+        })
+        self.assertEqual(self.conf['namespaces.exclude'],
+                         ['source_db_1.col', 'source_db_2.col', 'source_db_3.col'])
 
     def test_namespace_set_validation(self):
         # duplicate ns_set
         args = {
-            "-n": "a,a,b",
-            "-g": "1,2,3"
+            "-n": "a.x,a.x,b.y",
+            "-g": "1.0,2.0,3.0"
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
         d = {
-            'namespaces': {'include': ['a', 'a', 'b']}
+            'namespaces': {'include': ['a.x', 'a.x', 'b.y']}
+        }
+        self.assertRaises(errors.InvalidConfiguration, self.load_json, d)
+
+        # duplicate ex_ns_set
+        args = {
+            "-x": "a.x,a.x,b.y"
+        }
+        self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
+        d = {
+            'namespaces': {'exclude': ['a.x', 'a.x', 'b.y']}
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_json, d)
 
         # duplicate gridfs_set
         args = {
-            '--gridfs-set': 'a,a,b'
+            '--gridfs-set': 'a.x,a.x,b.y'
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
         d = {
-            'namespaces': {'gridfs': ['a', 'a', 'b']}
+            'namespaces': {'gridfs': ['a.x', 'a.x', 'b.y']}
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_json, d)
 
         # duplicate dest_ns_set
         args = {
-            "-n": "a,b,c",
-            "--dest-namespace-set": "1,3,3"
+            "-n": "a.x,b.y,c.z",
+            "--dest-namespace-set": "1.0,3.0,3.0"
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
         d = {
             'namespaces': {'mapping': {
-                'a': 'c',
-                'b': 'c'
+                'a.x': 'c.z',
+                'b.y': 'c.z'
             }}
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_json, d)
 
         # len(ns_set) < len(dest_ns_set)
         args = {
-            "--namespace-set": "a,b,c",
-            "-g": "1,2,3,4"
+            "--namespace-set": "a.x,b.y,c.z",
+            "-g": "1.0,2.0,3.0,4.0"
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
 
         # len(ns_set) > len(dest_ns_set)
         args = {
-            "--namespace-set": "a,b,c,d",
-            "--dest-namespace-set": "1,2,3"
+            "--namespace-set": "a.x,b.y,c.z,d.j",
+            "--dest-namespace-set": "1.0,2.0,3.0"
         }
         self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
+
+        # validate ns_set format
+        args = {
+            "-n": "a*.x*"
+        }
+        self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
+        d = {
+            'namespaces': {'include': ['a*.x*']}
+        }
+        self.assertRaises(errors.InvalidConfiguration, self.load_json, d)
+
+        # validate dest_ns_set format
+        args = {
+            "-n": "a.x*",
+            "-g": "1*.0*"
+        }
+        self.assertRaises(errors.InvalidConfiguration, self.load_options, args)
+        d = {
+            'namespaces': {'mapping': {
+                'a*.x*': '1.0'
+            }}
+        }
+        self.assertRaises(errors.InvalidConfiguration, self.load_json, d)
+        d = {
+            'namespaces': {'mapping': {
+                'a.x*': '1*.0*'
+            }}
+        }
+        self.assertRaises(errors.InvalidConfiguration, self.load_json, d)
+
+    def test_validate_mixed_namespace_format(self):
+        # It is invalid to combine new and old namespace formats
+        mix_namespaces = [
+            {'mapping': {'old.format': 'old.format2'}, 'new.format': True},
+            {'gridfs': ['old.format'], 'new.format': True},
+            {'include': ['old.format'], 'new.format': True},
+            {'exclude': ['old.format'], 'new.format': True},
+        ]
+        for namespaces in mix_namespaces:
+            with self.assertRaises(errors.InvalidConfiguration):
+                self.load_json({'namespaces': namespaces})
+
 
     def test_doc_managers_from_args(self):
         # Test basic docmanager construction from args
@@ -447,10 +512,9 @@ class TestConnectorConfig(unittest.TestCase):
         self.assertEqual(mc.ssl_kwargs.get('ssl_cert_reqs'),
                          self.config['ssl.sslCertificatePolicy'])
         command_helper = mc.doc_managers[0].command_helper
-        self.assertEqual(command_helper.namespace_set,
-                         self.config['namespaces.include'])
-        self.assertEqual(command_helper.dest_mapping,
-                         self.config['namespaces.mapping'])
+        for name in self.config['namespaces.mapping']:
+            self.assertTrue(
+                command_helper.namespace_config.map_namespace(name))
 
         # Test Logger options.
         log_levels = [
@@ -480,7 +544,8 @@ class TestConnectorConfig(unittest.TestCase):
 
         # Test keyword arguments passed to OplogThread.
         ot_kwargs = mc.kwargs
-        self.assertEqual(ot_kwargs['ns_set'], self.config['namespaces.include'])
+        self.assertEqual(ot_kwargs['ns_set'],
+                         self.config['namespaces.include'])
         self.assertEqual(ot_kwargs['collection_dump'],
                          not self.config['noDump'])
         self.assertEqual(ot_kwargs['gridfs_set'],
@@ -491,7 +556,8 @@ class TestConnectorConfig(unittest.TestCase):
         self.assertEqual(ot_kwargs['batch_size'], self.config['batchSize'])
 
         # Test DocManager options.
-        for dm, dm_expected in zip(mc.doc_managers, self.config['docManagers']):
+        for dm, dm_expected in zip(mc.doc_managers,
+                                   self.config['docManagers']):
             self.assertEqual(dm.kwargs, dm_expected.kwargs)
             self.assertEqual(dm.auto_commit_interval,
                              dm_expected.auto_commit_interval)
@@ -516,6 +582,13 @@ class TestConnectorConfig(unittest.TestCase):
         self.config.load_json(
             json.dumps(TestConnectorConfig.set_everything_config))
         self.config.parse_args(self.set_everything_differently_argv)
+
+        first_dm = self.config['docManagers'][0]
+        first_dm_config = self.set_everything_config['docManagers'][0]
+        self.assertEqual(first_dm.url, 'localhost:54321')
+        self.assertEqual(first_dm.chunk_size, first_dm_config['bulkSize'])
+        self.assertEqual(first_dm.kwargs.get('clientOptions'),
+                         first_dm_config['args']['clientOptions'])
         self.assertConnectorState()
 
     def test_client_options(self):

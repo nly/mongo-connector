@@ -37,6 +37,16 @@ wrap_exceptions = exception_wrapper({
 
 LOG = logging.getLogger(__name__)
 
+__version__ = constants.__version__
+"""MongoDB DocManager version information
+
+This is packaged with mongo-connector so it shares the same version.
+Downstream DocManager implementations should add their package __version__
+string here, for example:
+
+__version__ = '0.1.0'
+"""
+
 
 class DocManager(DocManagerBase):
     """The DocManager class creates a connection to the backend engine and
@@ -60,7 +70,6 @@ class DocManager(DocManagerBase):
             raise errors.ConnectionFailed("Invalid URI for MongoDB")
         except pymongo.errors.ConnectionFailure:
             raise errors.ConnectionFailed("Failed to connect to MongoDB")
-        self.namespace_set = kwargs.get("namespace_set")
         self.chunk_size = kwargs.get('chunk_size', constants.DEFAULT_MAX_BULK)
         self.use_single_meta_collection = kwargs.get(
             'use_single_meta_collection',
@@ -101,24 +110,15 @@ class DocManager(DocManagerBase):
             return namespace
 
     @wrap_exceptions
-    def _namespaces(self):
-        """Provides the list of namespaces being replicated to MongoDB
+    def _meta_collections(self):
+        """Provides the meta collections currently being used
         """
-        if self.namespace_set:
-            return self.namespace_set
-
-        user_namespaces = []
-        db_list = self.mongo.database_names()
-        for database in db_list:
-            if database == "config" or database == "local":
-                continue
-            coll_list = self.mongo[database].collection_names()
-            for coll in coll_list:
-                if coll.startswith("system"):
-                    continue
-                namespace = "%s.%s" % (database, coll)
-                user_namespaces.append(namespace)
-        return user_namespaces
+        if self.use_single_meta_collection:
+            yield self.meta_collection_name
+        else:
+            for name in self.meta_database.collection_names(
+                    include_system_collections=False):
+                yield name
 
     def stop(self):
         """Stops any running threads
@@ -278,13 +278,10 @@ class DocManager(DocManagerBase):
     def search(self, start_ts, end_ts):
         """Called to query Mongo for documents in a time range.
         """
-        for namespace in self._namespaces():
-            meta_collection_name = self._get_meta_collection(namespace)
-            for ts_ns_doc in self.meta_database[meta_collection_name].find(
-                {'ns': namespace,
-                 '_ts': {'$lte': end_ts,
-                         '$gte': start_ts}}
-            ):
+        for meta_collection_name in self._meta_collections():
+            meta_coll = self.meta_database[meta_collection_name]
+            for ts_ns_doc in meta_coll.find(
+                    {'_ts': {'$lte': end_ts, '$gte': start_ts}}):
                 yield ts_ns_doc
 
     def commit(self):
@@ -297,11 +294,9 @@ class DocManager(DocManagerBase):
         """Returns the last document stored in Mongo.
         """
         def docs_by_ts():
-            for namespace in self._namespaces():
-                meta_collection = self._get_meta_collection(namespace)
-                mc_coll = self.meta_database[meta_collection]
-                mc_cursor = mc_coll.find({'ns': namespace}, limit=-1)
-                for ts_ns_doc in mc_cursor.sort('_ts', -1):
+            for meta_collection_name in self._meta_collections():
+                meta_coll = self.meta_database[meta_collection_name]
+                for ts_ns_doc in meta_coll.find(limit=-1).sort('_ts', -1):
                     yield ts_ns_doc
 
         return max(docs_by_ts(), key=lambda x: x["_ts"])

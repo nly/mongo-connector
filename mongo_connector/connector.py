@@ -11,29 +11,47 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Discovers the mongo cluster and starts the connector.
+"""Discovers the MongoDB cluster and starts the connector.
 """
 
+import copy
 import json
 import logging
 import logging.handlers
 import os
+import platform
 import pymongo
 import re
 import shutil
+import signal
 import ssl
 import sys
 import threading
 import time
+
 from mongo_connector import config, constants, errors, util
+from mongo_connector.constants import __version__
 from mongo_connector.locking_dict import LockingDict
 from mongo_connector.oplog_manager import OplogThread
 from mongo_connector.doc_managers import doc_manager_simulator as simulator
 from mongo_connector.doc_managers.doc_manager_base import DocManagerBase
 from mongo_connector.command_helper import CommandHelper
-from mongo_connector.util import log_fatal_exceptions
+from mongo_connector.util import log_fatal_exceptions, retry_until_ok
+from mongo_connector.namespace_config import (NamespaceConfig,
+                                              validate_namespace_options)
 
 from pymongo import MongoClient
+
+
+# Monkey patch logging to add Logger.always
+ALWAYS = logging.CRITICAL + 10
+logging.addLevelName(ALWAYS, 'ALWAYS')
+
+
+def always(self, message, *args, **kwargs):
+    self.log(ALWAYS, message, *args, **kwargs)
+logging.Logger.always = always
+
 
 LOG = logging.getLogger(__name__)
 
@@ -55,8 +73,14 @@ class Connector(threading.Thread):
         # can_run is set to false when we join the thread
         self.can_run = True
 
+        # The signal that caused the connector to stop or None
+        self.signal = None
+
         # main address - either mongos for sharded setups or a primary otherwise
         self.address = mongo_address
+
+        # connection to the main address
+        self.main_conn = None
 
         # List of DocManager instances
         if doc_managers:
@@ -102,9 +126,20 @@ class Connector(threading.Thread):
         # Save the rest of kwargs.
         self.kwargs = kwargs
 
+        # The namespace configuration shared by all OplogThreads and
+        # DocManagers
+        self.namespace_config = NamespaceConfig(
+            namespace_set=kwargs.get('ns_set'),
+            ex_namespace_set=kwargs.get('ex_ns_set'),
+            gridfs_set=kwargs.get('gridfs_set'),
+            dest_mapping=kwargs.get('dest_mapping'),
+            namespace_options=kwargs.get('namespace_options'),
+            include_fields=kwargs.get('fields'),
+            exclude_fields=kwargs.get('exclude_fields')
+        )
+
         # Initialize and set the command helper
-        command_helper = CommandHelper(kwargs.get('ns_set', []),
-                                       kwargs.get('dest_mapping', {}))
+        command_helper = CommandHelper(self.namespace_config)
         for dm in self.doc_managers:
             dm.command_helper = command_helper
 
@@ -147,7 +182,7 @@ class Connector(threading.Thread):
         connector = Connector(
             mongo_address=config['mainAddress'],
             doc_managers=config['docManagers'],
-            oplog_checkpoint=config['oplogFile'],
+            oplog_checkpoint=os.path.abspath(config['oplogFile']),
             collection_dump=(not config['noDump']),
             batch_size=config['batchSize'],
             continue_on_error=config['continueOnError'],
@@ -156,7 +191,9 @@ class Connector(threading.Thread):
             fields=config['fields'],
             exclude_fields=config['exclude_fields'],
             ns_set=config['namespaces.include'],
+            ex_ns_set=config['namespaces.exclude'],
             dest_mapping=config['namespaces.mapping'],
+            namespace_options=config['namespaces.namespace_options'],
             gridfs_set=config['namespaces.gridfs'],
             ssl_certfile=config['ssl.sslCertfile'],
             ssl_keyfile=config['ssl.sslKeyfile'],
@@ -170,9 +207,9 @@ class Connector(threading.Thread):
         """ Joins thread, stops it from running
         """
         self.can_run = False
+        super(Connector, self).join()
         for dm in self.doc_managers:
             dm.stop()
-        threading.Thread.join(self)
 
     def write_oplog_progress(self):
         """ Writes oplog progress to file provided by user
@@ -253,25 +290,44 @@ class Connector(threading.Thread):
                     (name, util.long_to_bson_ts(timestamp))
                     for name, timestamp in data)
 
+    def create_authed_client(self, address=None, **kwargs):
+        kwargs.update(self.ssl_kwargs)
+        if address is None:
+            address = self.address
+        client = MongoClient(address, tz_aware=self.tz_aware, **kwargs)
+        if self.auth_key is not None:
+            client['admin'].authenticate(self.auth_username, self.auth_key)
+        return client
+
     @log_fatal_exceptions
     def run(self):
         """Discovers the mongo cluster and creates a thread for each primary.
         """
-        main_conn = MongoClient(
-            self.address, tz_aware=self.tz_aware, **self.ssl_kwargs)
-        if self.auth_key is not None:
-            main_conn['admin'].authenticate(self.auth_username, self.auth_key)
+        self.main_conn = self.create_authed_client()
+        LOG.always('Source MongoDB version: %s',
+                   self.main_conn.admin.command('buildInfo')['version'])
+
+        for dm in self.doc_managers:
+            name = dm.__class__.__module__
+            module = sys.modules[name]
+            version = 'unknown'
+            if hasattr(module, '__version__'):
+                version = module.__version__
+            elif hasattr(module, 'version'):
+                version = module.version
+            LOG.always('Target DocManager: %s version: %s', name, version)
+
         self.read_oplog_progress()
         conn_type = None
 
         try:
-            main_conn.admin.command("isdbgrid")
+            self.main_conn.admin.command("isdbgrid")
         except pymongo.errors.OperationFailure:
             conn_type = "REPLSET"
 
         if conn_type == "REPLSET":
             # Make sure we are connected to a replica set
-            is_master = main_conn.admin.command("isMaster")
+            is_master = self.main_conn.admin.command("isMaster")
             if "setName" not in is_master:
                 LOG.error(
                     'No replica set at "%s"! A replica set is required '
@@ -280,20 +336,17 @@ class Connector(threading.Thread):
                 return
 
             # Establish a connection to the replica set as a whole
-            main_conn.close()
-            main_conn = MongoClient(
-                self.address, replicaSet=is_master['setName'],
-                tz_aware=self.tz_aware, **self.ssl_kwargs)
-            if self.auth_key is not None:
-                main_conn.admin.authenticate(self.auth_username, self.auth_key)
+            self.main_conn.close()
+            self.main_conn = self.create_authed_client(
+                replicaSet=is_master['setName'])
 
             # non sharded configuration
             oplog = OplogThread(
-                main_conn, self.doc_managers, self.oplog_progress,
-                **self.kwargs)
+                self.main_conn, self.doc_managers, self.oplog_progress,
+                self.namespace_config, **self.kwargs)
             self.shard_set[0] = oplog
             LOG.info('MongoConnector: Starting connection thread %s' %
-                     main_conn)
+                     self.main_conn)
             oplog.start()
 
             while self.can_run:
@@ -311,9 +364,10 @@ class Connector(threading.Thread):
                 time.sleep(1)
 
         else:       # sharded cluster
-            while self.can_run is True:
+            while self.can_run:
 
-                for shard_doc in main_conn['config']['shards'].find():
+                for shard_doc in retry_until_ok(self.main_conn.admin.command,
+                                                'listShards')['shards']:
                     shard_id = shard_doc['_id']
                     if shard_id in self.shard_set:
                         shard_thread = self.shard_set[shard_id]
@@ -340,19 +394,19 @@ class Connector(threading.Thread):
                             dm.stop()
                         return
 
-                    shard_conn = MongoClient(
-                        hosts, replicaSet=repl_set, tz_aware=self.tz_aware,
-                        **self.ssl_kwargs)
-                    if self.auth_key is not None:
-                        shard_conn['admin'].authenticate(self.auth_username, self.auth_key)
+                    shard_conn = self.create_authed_client(
+                        hosts, replicaSet=repl_set)
                     oplog = OplogThread(
                         shard_conn, self.doc_managers, self.oplog_progress,
+                        self.namespace_config, mongos_client=self.main_conn,
                         **self.kwargs)
                     self.shard_set[shard_id] = oplog
                     msg = "Starting connection thread"
                     LOG.info("MongoConnector: %s %s" % (msg, shard_conn))
                     oplog.start()
 
+        if self.signal is not None:
+            LOG.info("recieved signal %s: shutting down...", self.signal)
         self.oplog_thread_join()
         self.write_oplog_progress()
 
@@ -448,9 +502,10 @@ def get_config_options():
             raise errors.InvalidConfiguration(
                 "verbosity must be in the range [0, 3].")
 
+    # Default is warnings and above.
     verbosity = add_option(
         config_key="verbosity",
-        default=0,
+        default=1,
         type=int,
         apply_function=apply_verbosity)
 
@@ -500,6 +555,9 @@ def get_config_options():
 
         if cli_values['stdout']:
             option.value['type'] = 'stream'
+
+        # Expand the full path to log file
+        option.value['filename'] = os.path.abspath(option.value['filename'])
 
     default_logging = {
         'type': 'file',
@@ -683,40 +741,98 @@ def get_config_options():
         "exported. Supports dot notation for document fields but cannot span "
         "arrays. Cannot use both 'fields' and 'exclude_fields'.")
 
-    def apply_namespaces(option, cli_values):
-        if cli_values['ns_set']:
-            option.value['include'] = cli_values['ns_set'].split(',')
+    def merge_namespaces_cli(option, cli_values):
+        def validate_no_duplicates(lst, list_name):
+            if len(lst) != len(set(lst)):
+                raise errors.InvalidConfiguration(
+                    "%s should not contain any duplicates." % (list_name,))
 
-        if cli_values['gridfs_set']:
-            option.value['gridfs'] = cli_values['gridfs_set'].split(',')
+        if cli_values["ns_set"]:
+            option.value["include"] = cli_values["ns_set"].split(",")
 
-        if cli_values['dest_ns_set']:
-            ns_set = option.value['include']
-            dest_ns_set = cli_values['dest_ns_set'].split(',')
+        if cli_values["ex_ns_set"]:
+            option.value["exclude"] = cli_values["ex_ns_set"].split(",")
+
+        if cli_values["gridfs_set"]:
+            option.value["gridfs"] = cli_values["gridfs_set"].split(",")
+
+        if cli_values["dest_ns_set"]:
+            ns_set = option.value["include"]
+            dest_ns_set = cli_values["dest_ns_set"].split(",")
             if len(ns_set) != len(dest_ns_set):
                 raise errors.InvalidConfiguration(
                     "Destination namespace set should be the"
                     " same length as the origin namespace set.")
-            option.value['mapping'] = dict(zip(ns_set, dest_ns_set))
+            option.value["mapping"] = dict(zip(ns_set, dest_ns_set))
+
+        # Check for duplicates
+        if option.value["include"]:
+            validate_no_duplicates(option.value["include"],
+                                   "Include namespace set")
+        if option.value["exclude"]:
+            validate_no_duplicates(option.value["exclude"],
+                                   "Exclude namespace set")
+        if option.value["gridfs"]:
+            validate_no_duplicates(option.value["gridfs"],
+                                   "GridFS namespace set")
+        if option.value["mapping"]:
+            validate_no_duplicates(list(option.value["mapping"].values()),
+                                   "Destination namespace set")
+
+    def apply_namespaces(option, cli_values):
+        if (option.value['include'] or option.value['exclude'] or
+                option.value['mapping'] or option.value['gridfs']):
+            return apply_old_namespace_options(option, cli_values)
+        else:
+            return apply_new_namespace_options(option, cli_values)
+
+    def apply_new_namespace_options(option, cli_values):
+        """Apply the new format (since 2.5.0) namespaces options."""
+        merge_namespaces_cli(option, cli_values)
+        namespace_options = copy.deepcopy(option.value)
+        ns_set = namespace_options.pop('include', None)
+        ex_ns_set = namespace_options.pop('exclude', None)
+        gridfs_set = namespace_options.pop('gridfs', None)
+        dest_mapping = namespace_options.pop('mapping', None)
+        option.value["namespace_options"] = namespace_options
+
+        validate_namespace_options(
+            namespace_set=ns_set, ex_namespace_set=ex_ns_set,
+            dest_mapping=dest_mapping,
+            namespace_options=namespace_options, gridfs_set=gridfs_set)
+
+    def apply_old_namespace_options(option, cli_values):
+        """Apply the old format (before 2.5.0) namespaces options."""
+        merge_namespaces_cli(option, cli_values)
+
+        LOG.warning("Deprecation warning: the current namespaces "
+                    "configuration format is outdated and support may be "
+                    "removed in a future release. Please update your "
+                    "config file to use the new format.")
 
         ns_set = option.value['include']
-        if len(ns_set) != len(set(ns_set)):
-            raise errors.InvalidConfiguration(
-                "Namespace set should not contain any duplicates.")
-
-        dest_mapping = option.value['mapping']
-        if len(dest_mapping) != len(set(dest_mapping.values())):
-            raise errors.InvalidConfiguration(
-                "Destination namespaces set should not"
-                " contain any duplicates.")
-
+        ex_ns_set = option.value['exclude']
         gridfs_set = option.value['gridfs']
-        if len(gridfs_set) != len(set(gridfs_set)):
-            raise errors.InvalidConfiguration(
-                "GridFS set should not contain any duplicates.")
+        dest_mapping = option.value['mapping']
+
+        valid_names = set(['include', 'exclude', 'gridfs', 'mapping'])
+        valid_names |= set('__' + name for name in valid_names)
+        valid_names.add('__comment__')
+        for key in option.value:
+            if key not in valid_names:
+                raise errors.InvalidConfiguration(
+                    "Invalid option %s in old style (pre 2.5.0) namespaces "
+                    "configuration. The only valid option names are: %r" %
+                    (key, list(valid_names)))
+
+
+        validate_namespace_options(
+            namespace_set=ns_set, ex_namespace_set=ex_ns_set,
+            dest_mapping=dest_mapping, gridfs_set=gridfs_set)
 
     default_namespaces = {
         "include": [],
+        "exclude": [],
         "mapping": {},
         "gridfs": []
     }
@@ -735,10 +851,26 @@ def get_config_options():
         "consider. For example, if we wished to store all "
         "documents from the test.test and alpha.foo "
         "namespaces, we could use `-n test.test,alpha.foo`. "
+        "You can also use, for example, `-n test.*` to store "
+        "documents from all the collections of db test. "
         "The default is to consider all the namespaces, "
         "excluding the system and config databases, and "
         "also ignoring the \"system.indexes\" collection in "
-        "any database.")
+        "any database. This cannot be used together with "
+        "'--exclude-namespace-set'!")
+
+    # -x is to specify the namespaces we dont want to consider. The default
+    # is empty
+    namespaces.add_cli(
+        "-x", "--exclude-namespace-set", dest="ex_ns_set", help=
+        "Used to specify the namespaces we do not want to "
+        "consider. For example, if we wished to ignore all "
+        "documents from the test.test and alpha.foo "
+        "namespaces, we could use `-x test.test,alpha.foo`. "
+        "You can also use, for example, `-x test.*` to ignore "
+        "documents from all the collections of db test. "
+        "The default is not to exclude any namespace. "
+        "This cannot be used together with '--namespace-set'!")
 
     # -g is the destination namespace
     namespaces.add_cli(
@@ -747,8 +879,13 @@ def get_config_options():
         "namespace provided in the --namespace-set option "
         "will be mapped respectively according to this "
         "comma-separated list. These lists must have "
-        "equal length. The default is to use the identity "
-        "mapping. This works for mongo-to-mongo as well as" 
+        "equal length. "
+        "It also supports mapping using wildcard, for example, "
+        "map foo.* to bar_*.someting, means that if we have two "
+        "collections foo.a and foo.b, they will map to "
+        "bar_a.something and bar_b.something. "
+        "The default is to use the identity "
+        "mapping. This works for mongo-to-mongo as well as"
         "mongo-to-elasticsearch connections.")
 
     # --gridfs-set is the set of GridFS namespaces to consider
@@ -760,27 +897,20 @@ def get_config_options():
         "you can use `--gridfs-set test.fs`.")
 
     def apply_doc_managers(option, cli_values):
-        if cli_values['doc_manager'] is None:
-            if cli_values['target_url']:
-                raise errors.InvalidConfiguration(
-                    "Cannot create a Connector with a target URL"
-                    " but no doc manager.")
-        else:
-            if option.value is not None:
-                bulk_size = option.value[0].get(
-                    'bulkSize', constants.DEFAULT_MAX_BULK)
-            else:
-                bulk_size = constants.DEFAULT_MAX_BULK
-            option.value = [{
-                'docManager': cli_values['doc_manager'],
-                'targetURL': cli_values['target_url'],
-                'uniqueKey': cli_values['unique_key'],
-                'autoCommitInterval': cli_values['auto_commit_interval'],
-                'bulkSize': bulk_size
-            }]
-
         if not option.value:
-            return
+            if not cli_values['doc_manager'] and not cli_values['target_url']:
+                return
+            option.value = [{}]
+
+        # Command line options should override the first DocManager config.
+        cli_to_config = dict(doc_manager='docManager',
+                             target_url='targetURL',
+                             auto_commit_interval='autoCommitInterval',
+                             unique_key='uniqueKey')
+        first_dm = option.value[0]
+        for cli_name, value in cli_values.items():
+            if value is not None:
+                first_dm[cli_to_config[cli_name]] = value
 
         # validate doc managers and fill in default values
         for dm in option.value:
@@ -1051,6 +1181,23 @@ def setup_logging(conf):
     return root_logger
 
 
+def log_startup_info():
+    """Log info about the current environment."""
+    LOG.always('Starting mongo-connector version: %s', __version__)
+    if 'dev' in __version__:
+        LOG.warning('This is a development version (%s) of mongo-connector',
+                    __version__)
+    LOG.always('Python version: %s', sys.version)
+    LOG.always('Platform: %s', platform.platform())
+    LOG.always('pymongo version: %s', pymongo.__version__)
+    if not pymongo.has_c():
+        LOG.warning(
+            'pymongo version %s was installed without the C extensions. '
+            '"InvalidBSON: Date value out of range" errors may occur if '
+            'there are documents with BSON Datetimes that represent times '
+            'outside of Python\'s datetime limit.', pymongo.__version__)
+
+
 @log_fatal_exceptions
 def main():
     """ Starts the mongo connector (assuming CLI)
@@ -1059,20 +1206,26 @@ def main():
     conf.parse_args()
 
     setup_logging(conf)
-    LOG.info('Beginning Mongo Connector')
+    log_startup_info()
 
     connector = Connector.from_config(conf)
+
+    # Catch SIGTERM and SIGINT to cleanup the connector gracefully
+    def signame_handler(signal_name):
+        def sig_handler(signum, frame):
+            # Save the signal so it can be printed later
+            connector.signal = (signal_name, signum)
+            connector.can_run = False
+        return sig_handler
+    signal.signal(signal.SIGTERM, signame_handler('SIGTERM'))
+    signal.signal(signal.SIGINT, signame_handler('SIGINT'))
+
     connector.start()
 
     while True:
-        try:
-            time.sleep(3)
-            if not connector.is_alive():
-                break
-        except KeyboardInterrupt:
-            LOG.info("Caught keyboard interrupt, exiting!")
-            connector.join()
+        if not connector.is_alive():
             break
+        time.sleep(3)
 
 if __name__ == '__main__':
     main()

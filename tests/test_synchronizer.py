@@ -22,7 +22,10 @@ import time
 sys.path[0:0] = [""]
 
 from mongo_connector.connector import Connector
-from mongo_connector.test_utils import ReplicaSet, connector_opts, assert_soon
+from mongo_connector.namespace_config import NamespaceConfig
+from mongo_connector.test_utils import (assert_soon,
+                                        connector_opts,
+                                        ReplicaSetSingle)
 from tests import unittest
 
 
@@ -40,7 +43,7 @@ class TestSynchronizer(unittest.TestCase):
             pass
         open("oplog.timestamp", "w").close()
 
-        cls.repl_set = ReplicaSet().start()
+        cls.repl_set = ReplicaSetSingle().start()
         cls.conn = cls.repl_set.client()
         cls.connector = Connector(
             mongo_address=cls.repl_set.uri,
@@ -136,7 +139,8 @@ class TestSynchronizer(unittest.TestCase):
 
         # ensure update works when fields are given
         opthread = self.connector.shard_set[0]
-        opthread.fields = ['a', 'b', 'c']
+        opthread.namespace_config = NamespaceConfig(
+            include_fields=['a', 'b', 'c'])
         try:
             doc = update_and_retrieve({"$set": {"d": 10}})
             self.assertEqual(self.conn.test.test.find_one(doc['_id'])['d'], 10)

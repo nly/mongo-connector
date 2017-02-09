@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import re
 import sys
 import threading
 import time
@@ -27,20 +26,19 @@ sys.path[0:0] = [""]
 
 from mongo_connector.doc_managers.doc_manager_simulator import DocManager
 from mongo_connector.locking_dict import LockingDict
+from mongo_connector.namespace_config import NamespaceConfig
 from mongo_connector.oplog_manager import OplogThread
-from mongo_connector.test_utils import (ShardedCluster,
-                                        assert_soon,
-                                        close_client)
+from mongo_connector.test_utils import (assert_soon,
+                                        close_client,
+                                        ShardedCluster,
+                                        ShardedClusterSingle)
 from mongo_connector.util import retry_until_ok, bson_ts_to_long
 from tests import unittest, SkipTest
 
 
-class TestOplogManagerSharded(unittest.TestCase):
-    """Defines all test cases for OplogThreads running on a sharded
-    cluster
-    """
+class ShardedClusterTestCase(unittest.TestCase):
 
-    def setUp(self):
+    def set_up_sharded_cluster(self, sharded_cluster_type):
         """ Initialize the cluster:
 
         Clean out the databases used by the tests
@@ -48,7 +46,7 @@ class TestOplogManagerSharded(unittest.TestCase):
         Create and shard test collections
         Create OplogThreads
         """
-        self.cluster = ShardedCluster().start()
+        self.cluster = sharded_cluster_type().start()
 
         # Connection to mongos
         self.mongos_conn = self.cluster.client()
@@ -56,14 +54,16 @@ class TestOplogManagerSharded(unittest.TestCase):
         # Connections to the shards
         self.shard1_conn = self.cluster.shards[0].client()
         self.shard2_conn = self.cluster.shards[1].client()
-        self.shard1_secondary_conn = self.cluster.shards[0].secondary.client(
-            read_preference=ReadPreference.SECONDARY_PREFERRED)
-        self.shard2_secondary_conn = self.cluster.shards[1].secondary.client(
-            read_preference=ReadPreference.SECONDARY_PREFERRED
-        )
 
         # Wipe any test data
         self.mongos_conn["test"]["mcsharded"].drop()
+
+        # Disable the balancer before creating the collection
+        self.mongos_conn.config.settings.update_one(
+            {"_id": "balancer"},
+            {"$set": {"stopped": True}},
+            upsert=True
+        )
 
         # Create and shard the collection test.mcsharded on the "i" field
         self.mongos_conn["test"]["mcsharded"].create_index("i")
@@ -79,13 +79,6 @@ class TestOplogManagerSharded(unittest.TestCase):
             ("split", "test.mcsharded"),
             ("middle", {"i": 1000})
         ]))
-
-        # disable the balancer
-        self.mongos_conn.config.settings.update_one(
-            {"_id": "balancer"},
-            {"$set": {"stopped": True}},
-            upsert=True
-        )
 
         # Move chunks to their proper places
         try:
@@ -133,18 +126,20 @@ class TestOplogManagerSharded(unittest.TestCase):
         # Oplog threads (oplog manager) for each shard
         doc_manager = DocManager()
         oplog_progress = LockingDict()
+        namespace_config = NamespaceConfig(
+            namespace_set=["test.mcsharded", "test.mcunsharded"])
         self.opman1 = OplogThread(
             primary_client=self.shard1_conn,
             doc_managers=(doc_manager,),
             oplog_progress_dict=oplog_progress,
-            ns_set=["test.mcsharded", "test.mcunsharded"],
+            namespace_config=namespace_config,
             mongos_client=self.mongos_conn
         )
         self.opman2 = OplogThread(
             primary_client=self.shard2_conn,
             doc_managers=(doc_manager,),
             oplog_progress_dict=oplog_progress,
-            ns_set=["test.mcsharded", "test.mcunsharded"],
+            namespace_config=namespace_config,
             mongos_client=self.mongos_conn
         )
 
@@ -152,17 +147,24 @@ class TestOplogManagerSharded(unittest.TestCase):
         try:
             self.opman1.join()
         except RuntimeError:
-            pass                # thread may not have been started
+            pass  # thread may not have been started
         try:
             self.opman2.join()
         except RuntimeError:
-            pass                # thread may not have been started
+            pass  # thread may not have been started
         close_client(self.mongos_conn)
         close_client(self.shard1_conn)
         close_client(self.shard2_conn)
-        close_client(self.shard1_secondary_conn)
-        close_client(self.shard2_secondary_conn)
         self.cluster.stop()
+
+
+class TestOplogManagerShardedSingle(ShardedClusterTestCase):
+    """Defines all test cases for OplogThreads running on a sharded
+    cluster with single node replica sets.
+    """
+
+    def setUp(self):
+        self.set_up_sharded_cluster(ShardedClusterSingle)
 
     def test_get_oplog_cursor(self):
         """Test the get_oplog_cursor method"""
@@ -184,8 +186,9 @@ class TestOplogManagerSharded(unittest.TestCase):
         latest_timestamp = self.opman1.get_last_oplog_timestamp()
         cursor = self.opman1.get_oplog_cursor(latest_timestamp)
         self.assertNotEqual(cursor, None)
-        self.assertEqual(cursor.count(), 1)
-        next_entry_id = cursor[0]['o']['_id']
+        entries = list(cursor)
+        self.assertEqual(len(entries), 1)
+        next_entry_id = entries[0]['o']['_id']
         retrieved = self.mongos_conn.test.mcsharded.find_one(next_entry_id)
         self.assertEqual(retrieved, doc)
 
@@ -232,9 +235,11 @@ class TestOplogManagerSharded(unittest.TestCase):
                 "i": i + 500
             })
         oplog1 = self.shard1_conn["local"]["oplog.rs"]
-        oplog1 = oplog1.find().sort("$natural", pymongo.DESCENDING).limit(-1)[0]
+        oplog1 = oplog1.find().sort("$natural",
+                                    pymongo.DESCENDING).limit(-1)[0]
         oplog2 = self.shard2_conn["local"]["oplog.rs"]
-        oplog2 = oplog2.find().sort("$natural", pymongo.DESCENDING).limit(-1)[0]
+        oplog2 = oplog2.find().sort("$natural",
+                                    pymongo.DESCENDING).limit(-1)[0]
         self.assertEqual(self.opman1.get_last_oplog_timestamp(),
                          oplog1["ts"])
         self.assertEqual(self.opman2.get_last_oplog_timestamp(),
@@ -324,46 +329,38 @@ class TestOplogManagerSharded(unittest.TestCase):
         cursor, cursor_empty = self.opman1.init_cursor()
         self.assertFalse(cursor_empty)
         self.assertEqual(self.opman1.checkpoint, last_ts1)
-        with self.opman1.oplog_progress as prog:
-            self.assertEqual(prog.get_dict()[self.opman1.replset_name],
-                             last_ts1)
+        self.assertEqual(self.opman1.read_last_checkpoint(), last_ts1)
         # init_cursor should point to startup message in shard2 oplog
         cursor, cursor_empty = self.opman2.init_cursor()
         self.assertFalse(cursor_empty)
         self.assertEqual(self.opman2.checkpoint, oplog_startup_ts)
 
         # No last checkpoint, no collection dump, stuff in oplog
+        # If collection dump is false the checkpoint should not be set
         progress = LockingDict()
         self.opman1.oplog_progress = self.opman2.oplog_progress = progress
         self.opman1.collection_dump = self.opman2.collection_dump = False
+        self.opman1.checkpoint = self.opman2.checkpoint = None
         collection.insert_one({"i": 1200})
-        last_ts2 = self.opman2.get_last_oplog_timestamp()
-        self.opman1.init_cursor()
-        self.assertEqual(self.opman1.checkpoint, last_ts1)
-        with self.opman1.oplog_progress as prog:
-            self.assertEqual(prog.get_dict()[self.opman1.replset_name],
-                             last_ts1)
+        cursor, cursor_empty = self.opman1.init_cursor()
+        self.assertFalse(cursor_empty)
+        self.assertIsNone(self.opman1.checkpoint)
+        self.assertEqual(next(cursor), next(self.opman1.get_oplog_cursor()))
         cursor, cursor_empty = self.opman2.init_cursor()
+        self.assertFalse(cursor_empty)
+        self.assertIsNone(self.opman2.checkpoint)
         for doc in cursor:
             last_doc = doc
         self.assertEqual(last_doc["o"]["i"], 1200)
-        self.assertEqual(self.opman2.checkpoint, last_ts2)
-        with self.opman2.oplog_progress as prog:
-            self.assertEqual(prog.get_dict()[self.opman2.replset_name],
-                             last_ts2)
 
         # Last checkpoint exists
-        progress = LockingDict()
-        self.opman1.oplog_progress = self.opman2.oplog_progress = progress
-        for i in range(1000):
-            collection.insert_one({"i": i + 500})
+        collection.insert_many([{"i": i + 500} for i in range(1000)])
         entry1 = list(
             self.shard1_conn["local"]["oplog.rs"].find(skip=200, limit=-2))
         entry2 = list(
             self.shard2_conn["local"]["oplog.rs"].find(skip=200, limit=-2))
-        progress.get_dict()[self.opman1.replset_name] = entry1[0]["ts"]
-        progress.get_dict()[self.opman2.replset_name] = entry2[0]["ts"]
-        self.opman1.oplog_progress = self.opman2.oplog_progress = progress
+        self.opman1.update_checkpoint(entry1[0]["ts"])
+        self.opman2.update_checkpoint(entry2[0]["ts"])
         self.opman1.checkpoint = self.opman2.checkpoint = None
         cursor1, _ = self.opman1.init_cursor()
         cursor2, _ = self.opman2.init_cursor()
@@ -371,19 +368,12 @@ class TestOplogManagerSharded(unittest.TestCase):
         self.assertEqual(entry2[1]["ts"], next(cursor2)["ts"])
         self.assertEqual(self.opman1.checkpoint, entry1[0]["ts"])
         self.assertEqual(self.opman2.checkpoint, entry2[0]["ts"])
-        with self.opman1.oplog_progress as prog:
-            self.assertEqual(prog.get_dict()[self.opman1.replset_name],
-                             entry1[0]["ts"])
-        with self.opman2.oplog_progress as prog:
-            self.assertEqual(prog.get_dict()[self.opman2.replset_name],
-                             entry2[0]["ts"])
+        self.assertEqual(self.opman1.read_last_checkpoint(), entry1[0]["ts"])
+        self.assertEqual(self.opman2.read_last_checkpoint(), entry2[0]["ts"])
 
         # Last checkpoint is behind
-        progress = LockingDict()
-        progress.get_dict()[self.opman1.replset_name] = bson.Timestamp(1, 0)
-        progress.get_dict()[self.opman2.replset_name] = bson.Timestamp(1, 0)
-        self.opman1.oplog_progress = self.opman2.oplog_progress = progress
-        self.opman1.checkpoint = self.opman2.checkpoint = None
+        self.opman1.update_checkpoint(bson.Timestamp(1, 0))
+        self.opman2.update_checkpoint(bson.Timestamp(1, 0))
         cursor, cursor_empty = self.opman1.init_cursor()
         self.assertTrue(cursor_empty)
         self.assertEqual(cursor, None)
@@ -392,6 +382,182 @@ class TestOplogManagerSharded(unittest.TestCase):
         self.assertTrue(cursor_empty)
         self.assertEqual(cursor, None)
         self.assertIsNotNone(self.opman2.checkpoint)
+
+    def test_with_chunk_migration(self):
+        """Test that DocManagers have proper state after both a successful
+        and an unsuccessful chunk migration
+        """
+
+        # Start replicating to dummy doc managers
+        self.opman1.start()
+        self.opman2.start()
+
+        collection = self.mongos_conn["test"]["mcsharded"]
+        for i in range(1000):
+            collection.insert_one({"i": i + 500})
+        # Assert current state of the mongoverse
+        self.assertEqual(self.shard1_conn["test"]["mcsharded"].find().count(),
+                         500)
+        self.assertEqual(self.shard2_conn["test"]["mcsharded"].find().count(),
+                         500)
+        assert_soon(lambda: len(self.opman1.doc_managers[0]._search()) == 1000)
+
+        # Test successful chunk move from shard 1 to shard 2
+        self.mongos_conn["admin"].command(
+            "moveChunk",
+            "test.mcsharded",
+            find={"i": 1},
+            to="demo-set-1"
+        )
+
+        # doc manager should still have all docs
+        all_docs = self.opman1.doc_managers[0]._search()
+        self.assertEqual(len(all_docs), 1000)
+        for i, doc in enumerate(sorted(all_docs, key=lambda x: x["i"])):
+            self.assertEqual(doc["i"], i + 500)
+
+        # Mark the collection as "dropped". This will cause migration to fail.
+        self.mongos_conn["config"]["collections"].update_one(
+            {"_id": "test.mcsharded"},
+            {"$set": {"dropped": True}}
+        )
+
+        # Test unsuccessful chunk move from shard 2 to shard 1
+        def fail_to_move_chunk():
+            self.mongos_conn["admin"].command(
+                "moveChunk",
+                "test.mcsharded",
+                find={"i": 1},
+                to="demo-set-0"
+            )
+        self.assertRaises(pymongo.errors.OperationFailure, fail_to_move_chunk)
+        # doc manager should still have all docs
+        all_docs = self.opman1.doc_managers[0]._search()
+        self.assertEqual(len(all_docs), 1000)
+        for i, doc in enumerate(sorted(all_docs, key=lambda x: x["i"])):
+            self.assertEqual(doc["i"], i + 500)
+
+    def test_upgrade_oplog_progress(self):
+        first_oplog_ts1 = self.opman1.oplog.find_one()['ts']
+        first_oplog_ts2 = self.opman2.oplog.find_one()['ts']
+        # Old format oplog progress file:
+        progress = {
+            str(self.opman1.oplog): bson_ts_to_long(first_oplog_ts1),
+            str(self.opman2.oplog): bson_ts_to_long(first_oplog_ts2)
+        }
+        # Set up oplog managers to use the old format.
+        oplog_progress = LockingDict()
+        oplog_progress.dict = progress
+        self.opman1.oplog_progress = oplog_progress
+        self.opman2.oplog_progress = oplog_progress
+        # Cause the oplog managers to update their checkpoints.
+        self.opman1.update_checkpoint(first_oplog_ts1)
+        self.opman2.update_checkpoint(first_oplog_ts2)
+        # New format should be in place now.
+        new_format = {
+            self.opman1.replset_name: first_oplog_ts1,
+            self.opman2.replset_name: first_oplog_ts2
+        }
+        self.assertEqual(
+            new_format,
+            self.opman1.oplog_progress.get_dict()
+        )
+        self.assertEqual(
+            new_format,
+            self.opman2.oplog_progress.get_dict()
+        )
+
+
+class TestOplogManagerSharded(ShardedClusterTestCase):
+    """Defines all test cases for OplogThreads running on a sharded
+    cluster with three node replica sets.
+    """
+
+    def setUp(self):
+        self.set_up_sharded_cluster(ShardedCluster)
+        self.shard1_secondary_conn = self.cluster.shards[0].secondary.client(
+            read_preference=ReadPreference.SECONDARY_PREFERRED)
+        self.shard2_secondary_conn = self.cluster.shards[1].secondary.client(
+            read_preference=ReadPreference.SECONDARY_PREFERRED
+        )
+
+    def tearDown(self):
+        super(TestOplogManagerSharded, self).tearDown()
+        close_client(self.shard1_secondary_conn)
+        close_client(self.shard2_secondary_conn)
+
+    def test_with_orphan_documents(self):
+        """Test that DocManagers have proper state after a chunk migration
+        that resuts in orphaned documents.
+        """
+        # Start replicating to dummy doc managers
+        self.opman1.start()
+        self.opman2.start()
+
+        collection = self.mongos_conn["test"]["mcsharded"]
+        collection.insert_many([{"i": i + 500} for i in range(1000)])
+        # Assert current state of the mongoverse
+        self.assertEqual(self.shard1_conn["test"]["mcsharded"].find().count(),
+                         500)
+        self.assertEqual(self.shard2_conn["test"]["mcsharded"].find().count(),
+                         500)
+        assert_soon(lambda: len(self.opman1.doc_managers[0]._search()) == 1000)
+
+        # Stop replication using the 'rsSyncApplyStop' failpoint.
+        # Note: this requires secondaries to ensure the subsequent moveChunk
+        # command does not complete.
+        self.shard1_conn.admin.command(
+            "configureFailPoint", "rsSyncApplyStop",
+            mode="alwaysOn"
+        )
+
+        # Move a chunk from shard2 to shard1
+        def move_chunk():
+            try:
+                self.mongos_conn["admin"].command(
+                    "moveChunk",
+                    "test.mcsharded",
+                    find={"i": 1000},
+                    to="demo-set-0"
+                )
+            except pymongo.errors.OperationFailure:
+                pass
+
+        # moveChunk will never complete, so use another thread to continue
+        mover = threading.Thread(target=move_chunk)
+        mover.start()
+
+        # wait for documents to start moving to shard 1
+        assert_soon(lambda: self.shard1_conn.test.mcsharded.count() > 500)
+
+        # Get opid for moveChunk command
+        operations = self.mongos_conn.test.current_op()
+        opid = None
+        for op in operations["inprog"]:
+            if op.get("query", {}).get("moveChunk"):
+                opid = op["opid"]
+
+        if opid is None:
+            raise SkipTest("could not find moveChunk operation, cannot test "
+                           "failed moveChunk")
+        # Kill moveChunk with the opid
+
+        if self.mongos_conn.server_info()['versionArray'][:3] >= [3, 1, 2]:
+            self.mongos_conn.admin.command('killOp', op=opid)
+        else:
+            self.mongos_conn["test"]["$cmd.sys.killop"].find_one({"op": opid})
+
+        # Mongo Connector should not become confused by unsuccessful chunk move
+        docs = self.opman1.doc_managers[0]._search()
+        self.assertEqual(len(docs), 1000)
+        self.assertEqual(sorted(d["i"] for d in docs),
+                         list(range(500, 1500)))
+        self.shard1_conn.admin.command(
+            "configureFailPoint", "rsSyncApplyStop",
+            mode="off"
+        )
+        # cleanup
+        mover.join()
 
     def test_rollback(self):
         """Test the rollback method in a sharded environment
@@ -422,13 +588,12 @@ class TestOplogManagerSharded(unittest.TestCase):
             lambda: shard1_secondary_admin.command("isMaster")["ismaster"])
 
         # Insert another document. This will be rolled back later
-        def cond():
-            try:
-                db_main.insert_one({"i": 1})
-            except:
-                pass
-            return db_main.find_one({"i": 1})
-        retry_until_ok(cond)
+        def insert_one(doc):
+            if not db_main.find_one(doc):
+                return db_main.insert_one(doc)
+            return True
+        assert_soon(lambda: retry_until_ok(insert_one, {"i": 1}),
+                    "could not insert into shard1 with one node down")
         db_secondary1 = self.shard1_secondary_conn["test"]["mcsharded"]
         db_secondary2 = self.shard2_secondary_conn["test"]["mcsharded"]
         self.assertEqual(db_secondary1.count(), 2)
@@ -492,10 +657,12 @@ class TestOplogManagerSharded(unittest.TestCase):
         assert_soon(
             lambda: shard2_secondary_admin.command("isMaster")["ismaster"])
 
-        # Insert another document on each shard. These will be rolled back later
-        retry_until_ok(db_main.insert_one, {"i": 1})
+        # Insert another document on each shard which will be rolled back later
+        assert_soon(lambda: retry_until_ok(insert_one, {"i": 1}),
+                    "could not insert into shard1 with one node down")
         self.assertEqual(db_secondary1.count(), 2)
-        retry_until_ok(db_main.insert_one, {"i": 1001})
+        assert_soon(lambda: retry_until_ok(insert_one, {"i": 1001}),
+                    "could not insert into shard2 with one node down")
         self.assertEqual(db_secondary2.count(), 2)
 
         # Wait for replication on the doc manager
@@ -540,163 +707,6 @@ class TestOplogManagerSharded(unittest.TestCase):
         i_values = [d["i"] for d in self.opman1.doc_managers[0]._search()]
         self.assertIn(0, i_values)
         self.assertIn(1000, i_values)
-
-    def test_with_chunk_migration(self):
-        """Test that DocManagers have proper state after both a successful
-        and an unsuccessful chunk migration
-        """
-
-        # Start replicating to dummy doc managers
-        self.opman1.start()
-        self.opman2.start()
-
-        collection = self.mongos_conn["test"]["mcsharded"]
-        for i in range(1000):
-            collection.insert_one({"i": i + 500})
-        # Assert current state of the mongoverse
-        self.assertEqual(self.shard1_conn["test"]["mcsharded"].find().count(),
-                         500)
-        self.assertEqual(self.shard2_conn["test"]["mcsharded"].find().count(),
-                         500)
-        assert_soon(lambda: len(self.opman1.doc_managers[0]._search()) == 1000)
-
-        # Test successful chunk move from shard 1 to shard 2
-        self.mongos_conn["admin"].command(
-            "moveChunk",
-            "test.mcsharded",
-            find={"i": 1},
-            to="demo-set-1"
-        )
-
-        # doc manager should still have all docs
-        all_docs = self.opman1.doc_managers[0]._search()
-        self.assertEqual(len(all_docs), 1000)
-        for i, doc in enumerate(sorted(all_docs, key=lambda x: x["i"])):
-            self.assertEqual(doc["i"], i + 500)
-
-        # Mark the collection as "dropped". This will cause migration to fail.
-        self.mongos_conn["config"]["collections"].update_one(
-            {"_id": "test.mcsharded"},
-            {"$set": {"dropped": True}}
-        )
-
-        # Test unsuccessful chunk move from shard 2 to shard 1
-        def fail_to_move_chunk():
-            self.mongos_conn["admin"].command(
-                "moveChunk",
-                "test.mcsharded",
-                find={"i": 1},
-                to="demo-set-0"
-            )
-        self.assertRaises(pymongo.errors.OperationFailure, fail_to_move_chunk)
-        # doc manager should still have all docs
-        all_docs = self.opman1.doc_managers[0]._search()
-        self.assertEqual(len(all_docs), 1000)
-        for i, doc in enumerate(sorted(all_docs, key=lambda x: x["i"])):
-            self.assertEqual(doc["i"], i + 500)
-
-    def test_with_orphan_documents(self):
-        """Test that DocManagers have proper state after a chunk migration
-        that resuts in orphaned documents.
-        """
-        # Start replicating to dummy doc managers
-        self.opman1.start()
-        self.opman2.start()
-
-        collection = self.mongos_conn["test"]["mcsharded"]
-        collection.insert_many([{"i": i + 500} for i in range(1000)])
-        # Assert current state of the mongoverse
-        self.assertEqual(self.shard1_conn["test"]["mcsharded"].find().count(),
-                         500)
-        self.assertEqual(self.shard2_conn["test"]["mcsharded"].find().count(),
-                         500)
-        assert_soon(lambda: len(self.opman1.doc_managers[0]._search()) == 1000)
-
-        # Stop replication using the 'rsSyncApplyStop' failpoint
-        self.shard1_conn.admin.command(
-            "configureFailPoint", "rsSyncApplyStop",
-            mode="alwaysOn"
-        )
-
-        # Move a chunk from shard2 to shard1
-        def move_chunk():
-            try:
-                self.mongos_conn["admin"].command(
-                    "moveChunk",
-                    "test.mcsharded",
-                    find={"i": 1000},
-                    to="demo-set-0"
-                )
-            except pymongo.errors.OperationFailure:
-                pass
-
-        # moveChunk will never complete, so use another thread to continue
-        mover = threading.Thread(target=move_chunk)
-        mover.start()
-
-        # wait for documents to start moving to shard 1
-        assert_soon(lambda: self.shard1_conn.test.mcsharded.count() > 500)
-
-        # Get opid for moveChunk command
-        operations = self.mongos_conn.test.current_op()
-        opid = None
-        for op in operations["inprog"]:
-            if op.get("query", {}).get("moveChunk"):
-                opid = op["opid"]
-
-        if opid is None:
-            raise SkipTest("could not find moveChunk operation, cannot test "
-                           "failed moveChunk")
-        # Kill moveChunk with the opid
-
-        if self.mongos_conn.server_info()['versionArray'][:3] >= [3, 1, 2]:
-            self.mongos_conn.admin.command('killOp', op=opid)
-        else:
-            self.mongos_conn["test"]["$cmd.sys.killop"].find_one({"op": opid})
-
-        # Mongo Connector should not become confused by unsuccessful chunk move
-        docs = self.opman1.doc_managers[0]._search()
-        self.assertEqual(len(docs), 1000)
-        self.assertEqual(sorted(d["i"] for d in docs),
-                         list(range(500, 1500)))
-        self.shard1_conn.admin.command(
-            "configureFailPoint", "rsSyncApplyStop",
-            mode="off"
-        )
-        # cleanup
-        mover.join()
-
-    def test_upgrade_oplog_progress(self):
-        first_oplog_ts1 = self.opman1.oplog.find_one()['ts']
-        first_oplog_ts2 = self.opman2.oplog.find_one()['ts']
-        # Old format oplog progress file:
-        progress = {
-            str(self.opman1.oplog): bson_ts_to_long(first_oplog_ts1),
-            str(self.opman2.oplog): bson_ts_to_long(first_oplog_ts2)
-        }
-        # Set up oplog managers to use the old format.
-        oplog_progress = LockingDict()
-        oplog_progress.dict = progress
-        self.opman1.oplog_progress = oplog_progress
-        self.opman2.oplog_progress = oplog_progress
-        # Cause the oplog managers to update their checkpoints.
-        self.opman1.checkpoint = first_oplog_ts1
-        self.opman2.checkpoint = first_oplog_ts2
-        self.opman1.update_checkpoint()
-        self.opman2.update_checkpoint()
-        # New format should be in place now.
-        new_format = {
-            self.opman1.replset_name: first_oplog_ts1,
-            self.opman2.replset_name: first_oplog_ts2
-        }
-        self.assertEqual(
-            new_format,
-            self.opman1.oplog_progress.get_dict()
-        )
-        self.assertEqual(
-            new_format,
-            self.opman2.oplog_progress.get_dict()
-        )
 
 
 if __name__ == '__main__':

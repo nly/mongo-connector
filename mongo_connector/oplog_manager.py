@@ -27,7 +27,7 @@ import threading
 
 import pymongo
 
-from pymongo import CursorType
+from pymongo import CursorType, errors as pymongo_errors
 
 from mongo_connector import errors, util
 from mongo_connector.constants import DEFAULT_BATCH_SIZE
@@ -37,13 +37,53 @@ from mongo_connector.util import log_fatal_exceptions, retry_until_ok
 LOG = logging.getLogger(__name__)
 
 
+class ReplicationLagLogger(threading.Thread):
+    """Thread that periodically logs the current replication lag.
+    """
+    def __init__(self, opman, interval):
+        super(ReplicationLagLogger, self).__init__()
+        self.opman = opman
+        self.interval = interval
+        self.daemon = True
+
+    def log_replication_lag(self):
+        checkpoint = self.opman.checkpoint
+        if checkpoint is None:
+            return
+        newest_write = retry_until_ok(self.opman.get_last_oplog_timestamp)
+        if newest_write < checkpoint:
+            # OplogThread will perform a rollback, don't log anything
+            return
+        lag_secs = newest_write.time - checkpoint.time
+        if lag_secs > 0:
+            LOG.info("OplogThread for replica set '%s' is %s seconds behind "
+                     "the oplog.",
+                     self.opman.replset_name, lag_secs)
+        else:
+            lag_inc = newest_write.inc - checkpoint.inc
+            if lag_inc > 0:
+                LOG.info("OplogThread for replica set '%s' is %s entries "
+                         "behind the oplog.",
+                         self.opman.replset_name, lag_inc)
+            else:
+                LOG.info("OplogThread for replica set '%s' is up to date "
+                         "with the oplog.",
+                         self.opman.replset_name)
+
+    def run(self):
+        while self.opman.is_alive():
+            self.log_replication_lag()
+            time.sleep(self.interval)
+
+
 class OplogThread(threading.Thread):
     """Thread that tails an oplog.
 
     Calls the appropriate method on DocManagers for each relevant oplog entry.
     """
     def __init__(self, primary_client, doc_managers,
-                 oplog_progress_dict, mongos_client=None, **kwargs):
+                 oplog_progress_dict, namespace_config,
+                 mongos_client=None, **kwargs):
         super(OplogThread, self).__init__()
 
         self.batch_size = kwargs.get('batch_size', DEFAULT_BATCH_SIZE)
@@ -71,23 +111,11 @@ class OplogThread(threading.Thread):
         # Represents the last checkpoint for a OplogThread.
         self.oplog_progress = oplog_progress_dict
 
-        # The set of namespaces to process from the mongo cluster.
-        self.namespace_set = kwargs.get('ns_set', [])
-
-        # The set of gridfs namespaces to process from the mongo cluster
-        self.gridfs_set = kwargs.get('gridfs_set', [])
-
-        # The dict of source namespaces to destination namespaces
-        self.dest_mapping = kwargs.get('dest_mapping', {})
+        # The namespace configuration
+        self.namespace_config = namespace_config
 
         # Whether the collection dump gracefully handles exceptions
         self.continue_on_error = kwargs.get('continue_on_error', False)
-
-        # Set of fields to export
-        self._exclude_fields = set([])
-        self.fields = kwargs.get('fields', None)
-        if kwargs.get('exclude_fields', None):
-            self.exclude_fields = kwargs['exclude_fields']
 
         LOG.info('OplogThread: Initializing oplog thread')
 
@@ -97,107 +125,76 @@ class OplogThread(threading.Thread):
 
         if not self.oplog.find_one():
             err_msg = 'OplogThread: No oplog for thread:'
-            LOG.warning('%s %s' % (err_msg, self.primary_connection))
+            LOG.warning('%s %s' % (err_msg, self.primary_client))
 
-    @property
-    def fields(self):
-        if self._fields:
-            return list(self._fields)
-        return None
+    def _should_skip_entry(self, entry):
+        """Determine if this oplog entry should be skipped.
 
-    @property
-    def exclude_fields(self):
-        if self._exclude_fields:
-            return list(self._exclude_fields)
-        return None
+        This has the possible side effect of modifying the entry's namespace
+        and filtering fields from updates and inserts.
+        """
+        # Don't replicate entries resulting from chunk moves
+        if entry.get("fromMigrate"):
+            return True, False
 
-    @fields.setter
-    def fields(self, value):
-        if self._exclude_fields:
-            raise errors.InvalidConfiguration(
-                "Cannot set 'fields' when 'exclude_fields' has already "
-                "been set to non-empty list.")
-        if value:
-            self._fields = set(value)
-            # Always include _id field
-            self._fields.add('_id')
-            self._projection = dict((field, 1) for field in self._fields)
-        else:
-            self._fields = set([])
-            self._projection = None
+        # Ignore no-ops
+        if entry['op'] == 'n':
+            return True, False
+        ns = entry['ns']
 
-    @exclude_fields.setter
-    def exclude_fields(self, value):
-        if self._fields:
-            raise errors.InvalidConfiguration(
-                "Cannot set 'exclude_fields' when 'fields' has already "
-                "been set to non-empty list.")
-        if value:
-            self._exclude_fields = set(value)
-            if '_id' in value:
-                LOG.warning("OplogThread: Cannot exclude '_id' field, "
-                            "ignoring")
-                self._exclude_fields.remove('_id')
-            if not self._exclude_fields:
-                self._projection = None
+        if '.' not in ns:
+            return True, False
+        coll = ns.split('.', 1)[1]
+
+        # Ignore system collections
+        if coll.startswith("system."):
+            return True, False
+
+        # Ignore GridFS chunks
+        if coll.endswith('.chunks'):
+            return True, False
+
+        is_gridfs_file = False
+        if coll.endswith(".files"):
+            ns = ns[:-len(".files")]
+            if self.namespace_config.gridfs_namespace(ns):
+                is_gridfs_file = True
             else:
-                self._projection = dict(
-                    (field, 0) for field in self._exclude_fields)
-        else:
-            self._exclude_fields = set([])
-            self._projection = None
+                return True, False
 
-    @property
-    def namespace_set(self):
-        return self._namespace_set
+        # Commands should not be ignored, filtered, or renamed. Renaming is
+        # handled by the DocManagers via the CommandHelper class.
+        if coll == "$cmd":
+            return False, False
 
-    @namespace_set.setter
-    def namespace_set(self, namespace_set):
-        self._namespace_set = namespace_set
-        self.update_oplog_ns_set()
+        # Rename or filter out namespaces that are ignored keeping
+        # included gridfs namespaces.
+        namespace = self.namespace_config.lookup(ns)
+        if namespace is None:
+            LOG.debug("OplogThread: Skipping oplog entry: "
+                      "'%s' is not in the namespace configuration." % (ns,))
+            return True, False
 
-    @property
-    def gridfs_set(self):
-        return self._gridfs_set
+        # Update the namespace.
+        entry['ns'] = namespace.dest_name
 
-    @gridfs_set.setter
-    def gridfs_set(self, gridfs_set):
-        self._gridfs_set = gridfs_set
-        self._gridfs_files_set = [ns + '.files' for ns in gridfs_set]
-        self.update_oplog_ns_set()
-
-    @property
-    def gridfs_files_set(self):
-        try:
-            return self._gridfs_files_set
-        except AttributeError:
-            return []
-
-    @property
-    def oplog_ns_set(self):
-        try:
-            return self._oplog_ns_set
-        except AttributeError:
-            return []
-
-    def update_oplog_ns_set(self):
-        self._oplog_ns_set = []
-        if self.namespace_set:
-            self._oplog_ns_set.extend(self.namespace_set)
-            self._oplog_ns_set.extend(self.gridfs_files_set)
-            self._oplog_ns_set.extend(set(
-                ns.split('.', 1)[0] + '.$cmd' for ns in self.namespace_set))
-            self._oplog_ns_set.append("admin.$cmd")
+        # Take fields out of the oplog entry that shouldn't be replicated.
+        # This may nullify the document if there's nothing to do.
+        if not self.filter_oplog_entry(
+                entry, include_fields=namespace.include_fields,
+                exclude_fields=namespace.exclude_fields):
+            return True, False
+        return False, is_gridfs_file
 
     @log_fatal_exceptions
     def run(self):
         """Start the oplog worker.
         """
+        ReplicationLagLogger(self, 30).start()
         LOG.debug("OplogThread: Run thread started")
         while self.running is True:
             LOG.debug("OplogThread: Getting cursor")
-            cursor, cursor_empty = self.init_cursor()
-
+            cursor, cursor_empty = retry_until_ok(self.init_cursor)
             # we've fallen too far behind
             if cursor is None and self.checkpoint is not None:
                 err_msg = "OplogThread: Last entry no longer in oplog"
@@ -217,63 +214,30 @@ class OplogThread(threading.Thread):
             upsert_inc = 0
             update_inc = 0
             try:
-                LOG.debug("OplogThread: about to process new oplog "
-                          "entries")
+                LOG.debug("OplogThread: about to process new oplog entries")
                 while cursor.alive and self.running:
                     LOG.debug("OplogThread: Cursor is still"
                               " alive and thread is still running.")
                     for n, entry in enumerate(cursor):
-
-                        LOG.debug("OplogThread: Iterating through cursor,"
-                                  " document number in this cursor is %d"
-                                  % n)
                         # Break out if this thread should stop
                         if not self.running:
                             break
 
-                        # Don't replicate entries resulting from chunk moves
-                        if entry.get("fromMigrate"):
-                            continue
+                        LOG.debug("OplogThread: Iterating through cursor,"
+                                  " document number in this cursor is %d"
+                                  % n)
 
-                        # Take fields out of the oplog entry that
-                        # shouldn't be replicated. This may nullify
-                        # the document if there's nothing to do.
-                        if not self.filter_oplog_entry(entry):
+                        skip, is_gridfs_file = self._should_skip_entry(entry)
+                        if skip:
+                            # update the last_ts on skipped entries to ensure
+                            # our checkpoint does not fall off the oplog. This
+                            # also prevents reprocessing skipped entries.
+                            last_ts = entry['ts']
                             continue
 
                         # Sync the current oplog operation
                         operation = entry['op']
                         ns = entry['ns']
-
-                        if '.' not in ns:
-                            continue
-                        coll = ns.split('.', 1)[1]
-
-                        # Ignore system collections
-                        if coll.startswith("system."):
-                            continue
-
-                        # Ignore GridFS chunks
-                        if coll.endswith('.chunks'):
-                            continue
-
-                        is_gridfs_file = False
-                        if coll.endswith(".files"):
-                            if ns in self.gridfs_files_set:
-                                ns = ns[:-len(".files")]
-                                is_gridfs_file = True
-                            else:
-                                continue
-
-                        # Ignore the collection if it is not included
-                        if self.oplog_ns_set and ns not in self.oplog_ns_set:
-                            LOG.debug("OplogThread: Skipping oplog entry: "
-                                      "'%s' is not in the namespace set." %
-                                      (ns,))
-                            continue
-
-                        # use namespace mapping if one exists
-                        ns = self.dest_mapping.get(ns, ns)
                         timestamp = util.bson_ts_to_long(entry['ts'])
                         for docman in self.doc_managers:
                             try:
@@ -339,16 +303,15 @@ class OplogThread(threading.Thread):
 
                         # update timestamp per batch size
                         # n % -1 (default for self.batch_size) == 0 for all n
-                        if n % self.batch_size == 1 and last_ts is not None:
-                            self.checkpoint = last_ts
-                            self.update_checkpoint()
+                        if n % self.batch_size == 1:
+                            self.update_checkpoint(last_ts)
+                            last_ts = None
 
                     # update timestamp after running through oplog
                     if last_ts is not None:
-                        LOG.debug("OplogThread: updating checkpoint after"
+                        LOG.debug("OplogThread: updating checkpoint after "
                                   "processing new oplog entries")
-                        self.checkpoint = last_ts
-                        self.update_checkpoint()
+                        self.update_checkpoint(last_ts)
 
             except (pymongo.errors.AutoReconnect,
                     pymongo.errors.OperationFailure,
@@ -363,8 +326,7 @@ class OplogThread(threading.Thread):
                 LOG.debug("OplogThread: updating checkpoint after an "
                           "Exception, cursor closing, or join() on this"
                           "thread.")
-                self.checkpoint = last_ts
-                self.update_checkpoint()
+                self.update_checkpoint(last_ts)
 
             LOG.debug("OplogThread: Sleeping. Documents removed: %d, "
                       "upserted: %d, updated: %d"
@@ -378,43 +340,87 @@ class OplogThread(threading.Thread):
         self.running = False
         threading.Thread.join(self)
 
-    def _pop_excluded_fields(self, doc):
+    @classmethod
+    def _find_field(cls, field, doc):
+        """Find the field in the document which matches the given field.
+
+        The field may be in dot notation, eg "a.b.c". Returns a list with
+        a single tuple (path, field_value) or the empty list if the field
+        is not present.
+        """
+        path = field.split('.')
+        try:
+            for key in path:
+                doc = doc[key]
+            return [(path, doc)]
+        except (KeyError, TypeError):
+            return []
+
+    @classmethod
+    def _find_update_fields(cls, field, doc):
+        """Find the fields in the update document which match the given field.
+
+        Both the field and the top level keys in the doc may be in dot
+        notation, eg "a.b.c". Returns a list of tuples (path, field_value) or
+        the empty list if the field is not present.
+        """
+        def find_partial_matches():
+            for key in doc:
+                if len(key) > len(field):
+                    # Handle case where field is a prefix of key, eg field is
+                    # 'a' and key is 'a.b'.
+                    if key.startswith(field) and key[len(field)] == '.':
+                        yield [key], doc[key]
+                        # Continue searching, there may be multiple matches.
+                        # For example, field 'a' should match 'a.b' and 'a.c'.
+                elif len(key) < len(field):
+                    # Handle case where key is a prefix of field, eg field is
+                    # 'a.b' and key is 'a'.
+                    if field.startswith(key) and field[len(key)] == '.':
+                        # Search for the remaining part of the field
+                        matched = cls._find_field(field[len(key) + 1:],
+                                                  doc[key])
+                        if matched:
+                            # Add the top level key to the path.
+                            match = matched[0]
+                            match[0].insert(0, key)
+                            yield match
+                        # Stop searching, it's not possible for any other
+                        # keys in the update doc to match this field.
+                        return
+
+        try:
+            return [([field], doc[field])]
+        except KeyError:
+            # Field does not exactly match any key in the update doc.
+            return list(find_partial_matches())
+
+    def _pop_excluded_fields(self, doc, exclude_fields, update=False):
         # Remove all the fields that were passed in exclude_fields.
         doc = self.convert(doc)
-        for field in self._exclude_fields:
-            curr_doc = doc
-            dots = field.split('.')
-            remove_up_to = curr_doc
-            end = dots[0]
-            for part in dots:
-                if not isinstance(curr_doc, dict) or part not in curr_doc:
-                    break
-                elif len(curr_doc) != 1:
-                    remove_up_to = curr_doc
-                    end = part
-                curr_doc = curr_doc[part]
-            else:
-                remove_up_to.pop(end)
+        find_fields = self._find_update_fields if update else self._find_field
+        for field in exclude_fields:
+            for path, _ in find_fields(field, doc):
+                # Delete each matching field in the original document.
+                temp_doc = doc
+                for p in path[:-1]:
+                    temp_doc = temp_doc[p]
+                temp_doc.pop(path[-1])
+
         return doc  # Need this to be similar to copy_included_fields.
 
     def _copy_included_fields(self, doc):
         # Copy over included fields to new doc
         doc = self.convert(doc)
         new_doc = {}
-        for field in self.fields:
-            dots = field.split('.')
-            curr_doc = doc
-            for part in dots:
-                if part not in curr_doc:
-                    break
-                else:
-                    curr_doc = curr_doc[part]
-            else:
-                # If we found the field in the original document, copy it
-                edit_doc = new_doc
-                for part in dots[:-1]:
-                    edit_doc = edit_doc.setdefault(part, {})
-                edit_doc[dots[-1]] = curr_doc
+        find_fields = self._find_update_fields if update else self._find_field
+        for field in include_fields:
+            for path, value in find_fields(field, doc):
+                # Copy each matching field in the original document.
+                temp_doc = new_doc
+                for p in path[:-1]:
+                    temp_doc = temp_doc.setdefault(p, {})
+                temp_doc[path[-1]] = value
 
         return new_doc
 
@@ -433,28 +439,32 @@ class OplogThread(threading.Thread):
 
         return new_doc
 
-    def filter_oplog_entry(self, entry):
+    def filter_oplog_entry(self, entry, include_fields=None,
+                           exclude_fields=None):
         """Remove fields from an oplog entry that should not be replicated.
 
         NOTE: this does not support array indexing, for example 'a.b.2'"""
-        if not self._fields and not self._exclude_fields:
+        if not include_fields and not exclude_fields:
             return entry
-        elif self._fields:
+        elif include_fields:
             filter_fields = self._copy_included_fields
         else:
             filter_fields = self._pop_excluded_fields
 
+        fields = include_fields or exclude_fields
         entry_o = entry['o']
         # 'i' indicates an insert. 'o' field is the doc to be inserted.
         if entry['op'] == 'i':
-            entry['o'] = filter_fields(entry_o)
+            entry['o'] = filter_fields(entry_o, fields)
         # 'u' indicates an update. The 'o' field describes an update spec
         # if '$set' or '$unset' are present.
         elif entry['op'] == 'u' and ('$set' in entry_o or '$unset' in entry_o):
             if '$set' in entry_o:
-                entry['o']["$set"] = filter_fields(entry_o["$set"])
+                entry['o']["$set"] = filter_fields(
+                    entry_o["$set"], fields, update=True)
             if '$unset' in entry_o:
-                entry['o']["$unset"] = filter_fields(entry_o["$unset"])
+                entry['o']["$unset"] = filter_fields(
+                    entry_o["$unset"], fields, update=True)
             # not allowed to have empty $set/$unset, so remove if empty
             if "$set" in entry_o and not entry_o['$set']:
                 entry_o.pop("$set")
@@ -465,7 +475,7 @@ class OplogThread(threading.Thread):
         # 'u' indicates an update. The 'o' field is the replacement document
         # if no '$set' or '$unset' are present.
         elif entry['op'] == 'u':
-            entry['o'] = filter_fields(entry_o)
+            entry['o'] = filter_fields(entry_o, fields)
 
         return entry
 
@@ -484,10 +494,14 @@ class OplogThread(threading.Thread):
             query['ts'] = {'$gte': timestamp}
             cursor = self.oplog.find(
                 query,
-                cursor_type=CursorType.TAILABLE_AWAIT)
-            # Applying 8 as the mask to the cursor enables OplogReplay
-            cursor.add_option(8)
+                cursor_type=CursorType.TAILABLE_AWAIT,
+                oplog_replay=True)
         return cursor
+
+    def get_collection(self, namespace):
+        """Get a pymongo collection from a namespace."""
+        database, coll = namespace.split('.', 1)
+        return self.primary_client[database][coll]
 
     def dump_collection(self):
         """Dumps collection into the target system.
@@ -496,16 +510,17 @@ class OplogThread(threading.Thread):
         configs i.e. when we're starting for the first time.
         """
 
-        timestamp = util.retry_until_ok(self.get_last_oplog_timestamp)
+        timestamp = retry_until_ok(self.get_last_oplog_timestamp)
         if timestamp is None:
             return None
         long_ts = util.bson_ts_to_long(timestamp)
+        # Flag if this oplog thread was cancelled during the collection dump.
+        # Use a list to workaround python scoping.
+        dump_cancelled = [False]
 
-        dump_set = self.namespace_set or []
-        LOG.debug("OplogThread: Dumping set of collections %s " % dump_set)
-
-        # No namespaces specified
-        if not self.namespace_set:
+        def get_all_ns():
+            ns_set = []
+            gridfs_ns_set = []
             db_list = retry_until_ok(self.primary_client.database_names)
             for database in db_list:
                 if database == "config" or database == "local":
@@ -516,36 +531,49 @@ class OplogThread(threading.Thread):
                     # ignore system collections
                     if coll.startswith("system."):
                         continue
-                    # ignore gridfs collections
-                    if coll.endswith(".files") or coll.endswith(".chunks"):
+                    # ignore gridfs chunks collections
+                    if coll.endswith(".chunks"):
                         continue
-                    namespace = "%s.%s" % (database, coll)
-                    dump_set.append(namespace)
+                    if coll.endswith(".files"):
+                        namespace = "%s.%s" % (database, coll)
+                        namespace = namespace[:-len(".files")]
+                        if self.namespace_config.gridfs_namespace(namespace):
+                            gridfs_ns_set.append(namespace)
+                    else:
+                        namespace = "%s.%s" % (database, coll)
+                        if self.namespace_config.map_namespace(namespace):
+                            ns_set.append(namespace)
+            return ns_set, gridfs_ns_set
 
-        def docs_to_dump(namespace):
-            database, coll = namespace.split('.', 1)
+        dump_set, gridfs_dump_set = get_all_ns()
+
+        LOG.debug("OplogThread: Dumping set of collections %s " % dump_set)
+
+        def docs_to_dump(from_coll):
             last_id = None
             attempts = 0
-
+            projection = self.namespace_config.projection(from_coll.full_name)
             # Loop to handle possible AutoReconnect
             while attempts < 60:
-                target_coll = self.primary_client[database][coll]
-                if not last_id:
-                    cursor = util.retry_until_ok(
-                        target_coll.find,
-                        projection=self._projection,
+                if last_id is None:
+                    cursor = retry_until_ok(
+                        from_coll.find,
+                        projection=projection,
                         sort=[("_id", pymongo.ASCENDING)]
                     )
                 else:
-                    cursor = util.retry_until_ok(
-                        target_coll.find,
+                    cursor = retry_until_ok(
+                        from_coll.find,
                         {"_id": {"$gt": last_id}},
-                        projection=self._projection,
+                        projection=projection,
                         sort=[("_id", pymongo.ASCENDING)]
                     )
                 try:
                     for doc in cursor:
                         if not self.running:
+                            # Thread was joined while performing the
+                            # collection dump.
+                            dump_cancelled[0] = True
                             raise StopIteration
                         last_id = doc["_id"]
                         yield doc
@@ -556,16 +584,15 @@ class OplogThread(threading.Thread):
                     time.sleep(1)
 
         def upsert_each(dm):
-            num_inserted = 0
             num_failed = 0
             for namespace in dump_set:
-                for num, doc in enumerate(docs_to_dump(namespace)):
-                    if num % 10000 == 0:
-                        LOG.debug("Upserted %d docs." % num)
+                from_coll = self.get_collection(namespace)
+                mapped_ns = self.namespace_config.map_namespace(namespace)
+                total_docs = retry_until_ok(from_coll.count)
+                num = None
+                for num, doc in enumerate(docs_to_dump(from_coll)):
                     try:
-                        mapped_ns = self.dest_mapping.get(namespace, namespace)
                         dm.upsert(doc, mapped_ns, long_ts)
-                        num_inserted += 1
                     except Exception:
                         if self.continue_on_error:
                             LOG.exception(
@@ -573,15 +600,29 @@ class OplogThread(threading.Thread):
                             num_failed += 1
                         else:
                             raise
-            LOG.debug("Upserted %d docs" % num_inserted)
+                    if num % 10000 == 0:
+                        LOG.info("Upserted %d out of approximately %d docs "
+                                 "from collection '%s'",
+                                 num + 1, total_docs, namespace)
+                if num is not None:
+                    LOG.info("Upserted %d out of approximately %d docs from "
+                             "collection '%s'",
+                             num + 1, total_docs, namespace)
             if num_failed > 0:
                 LOG.error("Failed to upsert %d docs" % num_failed)
 
         def upsert_all(dm):
             try:
                 for namespace in dump_set:
-                    mapped_ns = self.dest_mapping.get(namespace, namespace)
-                    dm.bulk_upsert(docs_to_dump(namespace), mapped_ns, long_ts)
+                    from_coll = self.get_collection(namespace)
+                    total_docs = retry_until_ok(from_coll.count)
+                    mapped_ns = self.namespace_config.map_namespace(
+                            namespace)
+                    LOG.info("Bulk upserting approximately %d docs from "
+                             "collection '%s'",
+                             total_docs, namespace)
+                    dm.bulk_upsert(docs_to_dump(from_coll),
+                                   mapped_ns, long_ts)
             except Exception:
                 if self.continue_on_error:
                     LOG.exception("OplogThread: caught exception"
@@ -593,24 +634,20 @@ class OplogThread(threading.Thread):
 
         def do_dump(dm, error_queue):
             try:
-                # Dump the documents, bulk upsert if possible
-                if hasattr(dm, "bulk_upsert"):
-                    LOG.debug("OplogThread: Using bulk upsert function for "
-                              "collection dump")
-                    upsert_all(dm)
-                else:
-                    LOG.debug(
-                        "OplogThread: DocManager %s has no "
-                        "bulk_upsert method.  Upserting documents "
-                        "serially for collection dump." % str(dm))
-                    upsert_each(dm)
+                LOG.debug("OplogThread: Using bulk upsert function for "
+                          "collection dump")
+                upsert_all(dm)
+
+                if gridfs_dump_set:
+                    LOG.info("OplogThread: dumping GridFS collections: %s",
+                             gridfs_dump_set)
 
                 # Dump GridFS files
-                for gridfs_ns in self.gridfs_set:
-                    db, coll = gridfs_ns.split('.', 1)
-                    mongo_coll = self.primary_client[db][coll]
-                    dest_ns = self.dest_mapping.get(gridfs_ns, gridfs_ns)
-                    for doc in docs_to_dump(gridfs_ns + '.files'):
+                for gridfs_ns in gridfs_dump_set:
+                    mongo_coll = self.get_collection(gridfs_ns)
+                    from_coll = self.get_collection(gridfs_ns + '.files')
+                    dest_ns = self.namespace_config.map_namespace(gridfs_ns)
+                    for doc in docs_to_dump(from_coll):
                         gridfile = GridFSFile(mongo_coll, doc)
                         dm.insert_file(gridfile, dest_ns, long_ts)
             except:
@@ -656,6 +693,11 @@ class OplogThread(threading.Thread):
             self.running = False
             return None
 
+        if dump_cancelled[0]:
+            LOG.warning('Initial collection dump was interrupted. '
+                        'Will re-run the collection dump on next startup.')
+            return None
+
         return timestamp
 
     def _get_oplog_timestamp(self, newest_entry):
@@ -663,8 +705,8 @@ class OplogThread(threading.Thread):
         """
         sort_order = pymongo.DESCENDING if newest_entry else pymongo.ASCENDING
         curr = self.oplog.find({'op': {'$ne': 'n'}}).sort(
-            '$natural', sort_order
-        ).limit(-1)
+                '$natural', sort_order
+            ).limit(-1)
 
         try:
             ts = next(curr)['ts']
@@ -672,8 +714,8 @@ class OplogThread(threading.Thread):
             LOG.debug("OplogThread: oplog is empty.")
             return None
 
-        LOG.debug("OplogThread: %s oplog entry has timestamp %d."
-                  % ('Newest' if newest_entry else 'Oldest', ts.time))
+        LOG.debug("OplogThread: %s oplog entry has timestamp %s."
+                  % ('Newest' if newest_entry else 'Oldest', ts))
         return ts
 
     def get_oldest_oplog_timestamp(self):
@@ -688,7 +730,9 @@ class OplogThread(threading.Thread):
 
     def _cursor_empty(self, cursor):
         try:
-            next(cursor.clone().limit(-1))
+            # Tailable cursors can not have singleBatch=True in MongoDB > 3.3
+            next(cursor.clone().remove_option(CursorType.TAILABLE_AWAIT)
+                 .limit(-1))
             return False
         except StopIteration:
             return True
@@ -707,90 +751,77 @@ class OplogThread(threading.Thread):
             if self.collection_dump:
                 # dump collection and update checkpoint
                 timestamp = self.dump_collection()
+                self.update_checkpoint(timestamp)
                 if timestamp is None:
                     return None, True
             else:
                 # Collection dump disabled:
-                # return cursor to beginning of oplog.
+                # Return cursor to beginning of oplog but do not set the
+                # checkpoint. The checkpoint will be set after an operation
+                # has been applied.
                 cursor = self.get_oplog_cursor()
-                self.checkpoint = self.get_last_oplog_timestamp()
-                self.update_checkpoint()
-                return cursor, retry_until_ok(self._cursor_empty, cursor)
+                return cursor, self._cursor_empty(cursor)
 
-        self.checkpoint = timestamp
-        self.update_checkpoint()
+        cursor = self.get_oplog_cursor(timestamp)
+        cursor_empty = self._cursor_empty(cursor)
 
-        for i in range(60):
-            cursor = self.get_oplog_cursor(timestamp)
-            cursor_empty = retry_until_ok(self._cursor_empty, cursor)
+        if cursor_empty:
+            # rollback, update checkpoint, and retry
+            LOG.debug("OplogThread: Initiating rollback from "
+                      "get_oplog_cursor")
+            self.update_checkpoint(self.rollback())
+            return self.init_cursor()
 
-            if cursor_empty:
-                # rollback, update checkpoint, and retry
-                LOG.debug("OplogThread: Initiating rollback from "
-                          "get_oplog_cursor")
-                self.checkpoint = self.rollback()
-                self.update_checkpoint()
-                return self.init_cursor()
+        first_oplog_entry = next(cursor)
 
-            # try to get the first oplog entry
-            try:
-                first_oplog_entry = retry_until_ok(next, cursor)
-            except StopIteration:
-                # It's possible for the cursor to become invalid
-                # between the next(cursor) call and now
-                time.sleep(1)
-                continue
+        oldest_ts_long = util.bson_ts_to_long(
+            self.get_oldest_oplog_timestamp())
+        checkpoint_ts_long = util.bson_ts_to_long(timestamp)
+        if checkpoint_ts_long < oldest_ts_long:
+            # We've fallen behind, the checkpoint has fallen off the oplog
+            return None, True
 
-            oldest_ts_long = util.bson_ts_to_long(
-                self.get_oldest_oplog_timestamp())
-            checkpoint_ts_long = util.bson_ts_to_long(timestamp)
-            if checkpoint_ts_long < oldest_ts_long:
-                # We've fallen behind, the checkpoint has fallen off the oplog
-                return None, True
+        cursor_ts_long = util.bson_ts_to_long(first_oplog_entry["ts"])
+        if cursor_ts_long > checkpoint_ts_long:
+            # The checkpoint is not present in this oplog and the oplog
+            # did not rollover. This means that we connected to a new
+            # primary which did not replicate the checkpoint and which has
+            # new changes in its oplog for us to process.
+            # rollback, update checkpoint, and retry
+            LOG.debug("OplogThread: Initiating rollback from "
+                      "get_oplog_cursor: new oplog entries found but "
+                      "checkpoint is not present")
+            self.update_checkpoint(self.rollback())
+            return self.init_cursor()
 
-            cursor_ts_long = util.bson_ts_to_long(first_oplog_entry["ts"])
-            if cursor_ts_long > checkpoint_ts_long:
-                # The checkpoint is not present in this oplog and the oplog
-                # did not rollover. This means that we connected to a new
-                # primary which did not replicate the checkpoint and which has
-                # new changes in its oplog for us to process.
-                # rollback, update checkpoint, and retry
-                LOG.debug("OplogThread: Initiating rollback from "
-                          "get_oplog_cursor: new oplog entries found but "
-                          "checkpoint is not present")
-                self.checkpoint = self.rollback()
-                self.update_checkpoint()
-                return self.init_cursor()
+        # first entry has been consumed
+        return cursor, cursor_empty
 
-            # first entry has been consumed
-            return cursor, cursor_empty
-
-        else:
-            raise errors.MongoConnectorError(
-                "Could not initialize oplog cursor.")
-
-    def update_checkpoint(self):
+    def update_checkpoint(self, checkpoint):
         """Store the current checkpoint in the oplog progress dictionary.
         """
-        if self.checkpoint is not None:
+        if checkpoint is not None and checkpoint != self.checkpoint:
+            self.checkpoint = checkpoint
             with self.oplog_progress as oplog_prog:
                 oplog_dict = oplog_prog.get_dict()
-                # If we have the repr of our oplog collection in the dictionary,
-                # remove it and replace it with our replica set name.
+                # If we have the repr of our oplog collection
+                # in the dictionary, remove it and replace it
+                # with our replica set name.
                 # This allows an easy upgrade path from mongo-connector 2.3.
                 # For an explanation of the format change, see the comment in
                 # read_last_checkpoint.
                 oplog_dict.pop(str(self.oplog), None)
-                oplog_dict[self.replset_name] = self.checkpoint
-                LOG.debug("OplogThread: oplog checkpoint updated to %s" %
-                          str(self.checkpoint))
+                oplog_dict[self.replset_name] = checkpoint
+                LOG.debug("OplogThread: oplog checkpoint updated to %s",
+                          checkpoint)
         else:
             LOG.debug("OplogThread: no checkpoint to update.")
 
     def read_last_checkpoint(self):
         """Read the last checkpoint from the oplog progress dictionary.
         """
-        # In versions of mongo-connector 2.3 and before, we used the repr of the
+        # In versions of mongo-connector 2.3 and before,
+        # we used the repr of the
         # oplog collection as keys in the oplog_progress dictionary.
         # In versions thereafter, we use the replica set name. For backwards
         # compatibility, we check for both.
@@ -811,6 +842,7 @@ class OplogThread(threading.Thread):
 
         LOG.debug("OplogThread: reading last checkpoint as %s " %
                   str(ret_val))
+        self.checkpoint = ret_val
         return ret_val
 
     def rollback(self):
@@ -842,7 +874,7 @@ class OplogThread(threading.Thread):
         target_ts = util.long_to_bson_ts(last_inserted_doc['_ts'])
         last_oplog_entry = util.retry_until_ok(
             self.oplog.find_one,
-            {'ts': {'$lte': target_ts}},
+            {'ts': {'$lte': target_ts}, 'op': {'$ne': 'n'}},
             sort=[('$natural', pymongo.DESCENDING)]
         )
 
@@ -874,10 +906,10 @@ class OplogThread(threading.Thread):
             # or removing them in each target system
             for namespace, doc_list in rollback_set.items():
                 # Get the original namespace
-                original_namespace = namespace
-                for source_name, dest_name in self.dest_mapping.items():
-                    if dest_name == namespace:
-                        original_namespace = source_name
+                original_namespace = self.namespace_config.unmap_namespace(
+                    namespace)
+                if not original_namespace:
+                    original_namespace = namespace
 
                 database, coll = original_namespace.split('.', 1)
                 obj_id = bson.objectid.ObjectId
@@ -888,7 +920,8 @@ class OplogThread(threading.Thread):
                 to_update = util.retry_until_ok(
                     client[database][coll].find,
                     {'_id': {'$in': bson_obj_id_list}},
-                    projection=self._projection
+                    projection=self.namespace_config.projection(
+                        original_namespace)
                 )
                 # Doc list are docs in target system, to_update are
                 # Docs in mongo
@@ -936,7 +969,7 @@ class OplogThread(threading.Thread):
                     try:
                         insert_inc += 1
                         dm.upsert(doc,
-                                  self.dest_mapping.get(namespace, namespace),
+                                  namespace,
                                   util.bson_ts_to_long(rollback_cutoff_ts))
                     except errors.OperationFailed:
                         fail_insert_inc += 1

@@ -43,7 +43,7 @@ except ImportError:
     from setuptools import setup
 
 extra_opts = {"test_suite": "tests",
-              "tests_require": ["mongo-orchestration>= 0.2, < 0.4",
+              "tests_require": ["mongo-orchestration>=0.6.7,<1.0",
                                 "requests>=2.5.1"]}
 
 if sys.version_info[:2] == (2, 6):
@@ -115,7 +115,7 @@ extra_opts['cmdclass'] = {
 }
 
 setup(name='mongo-connector',
-      version="2.5.0.dev0",
+      version="2.5.0",
       author="MongoDB, Inc.",
       author_email='mongodb-user@googlegroups.com',
       description='Mongo Connector',
@@ -137,7 +137,10 @@ setup(name='mongo-connector',
       extras_require={
           "solr": ["solr-doc-manager"],
           "elastic": ["elastic-doc-manager"],
-          "elastic2": ["elastic2-doc-manager"]
+          "elastic-aws": ["elastic-doc-manager[aws]"],
+          "elastic2": ["elastic2-doc-manager[elastic2]"],
+          "elastic5": ["elastic2-doc-manager[elastic5]"],
+          "elastic2-aws": ["elastic2-doc-manager[elastic2,aws]"],
       },
       **extra_opts
 )

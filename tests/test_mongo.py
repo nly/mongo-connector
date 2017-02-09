@@ -29,6 +29,7 @@ from mongo_connector.doc_managers.mongo_doc_manager import DocManager
 from mongo_connector.connector import Connector
 from mongo_connector.util import retry_until_ok
 from mongo_connector.test_utils import (ReplicaSet,
+                                        ReplicaSetSingle,
                                         Server,
                                         connector_opts,
                                         assert_soon,
@@ -61,7 +62,8 @@ class MongoTestCase(unittest.TestCase):
         collection_name = 'test.test'
         if self.use_single_meta_collection:
             collection_name = '__oplog'
-        for doc in self.mongo_conn['__mongo_connector'][collection_name].find():
+        col = self.mongo_conn['__mongo_connector'][collection_name]
+        for doc in col.find():
             if doc.get('gridfs_id'):
                 for f in fs.find({'_id': doc['gridfs_id']}):
                     doc['filename'] = f.filename
@@ -69,32 +71,17 @@ class MongoTestCase(unittest.TestCase):
                     yield doc
 
     def _remove(self):
-        self.mongo_conn['test']['test'].drop()
-        self.mongo_conn['test']['test.files'].drop()
-        self.mongo_conn['test']['test.chunks'].drop()
+        for db in self.mongo_conn.database_names():
+            if db not in ["local", "admin"]:
+                self.mongo_conn.drop_database(db)
 
 
-class TestMongo(MongoTestCase):
-    """ Tests the mongo instance
-    """
-
-    @classmethod
-    def setUpClass(cls):
-        MongoTestCase.setUpClass()
-        cls.repl_set = ReplicaSet().start()
-        cls.conn = cls.repl_set.client()
-
-    @classmethod
-    def tearDownClass(cls):
-        """ Kills cluster instance
-        """
-        MongoTestCase.tearDownClass()
-        cls.repl_set.stop()
-
-    def tearDown(self):
-        self.connector.join()
+class MongoReplicaSetTestCase(MongoTestCase):
 
     def setUp(self):
+        self.repl_set = self.replica_set_class().start()
+        self.conn = self.repl_set.client()
+
         try:
             os.unlink("oplog.timestamp")
         except OSError:
@@ -102,19 +89,39 @@ class TestMongo(MongoTestCase):
         self._remove()
         self.connector = Connector(
             mongo_address=self.repl_set.uri,
-            ns_set=['test.test'],
             doc_managers=(self.mongo_doc,),
-            gridfs_set=['test.test'],
+            namespace_options={
+                'test.test': {'gridfs': True},
+                'rename.me': 'new.target',
+                'rename.me2': 'new2.target2'
+            },
             **connector_opts
         )
-
-        self.conn.test.test.drop()
-        self.conn.test.test.files.drop()
-        self.conn.test.test.chunks.drop()
 
         self.connector.start()
         assert_soon(lambda: len(self.connector.shard_set) > 0)
         assert_soon(lambda: sum(1 for _ in self._search()) == 0)
+
+    def drop_all_databases(self):
+        for name in self.mongo_conn.database_names():
+            if name not in ["local", "admin"]:
+                self.mongo_conn.drop_database(name)
+        for name in self.conn.database_names():
+            if name not in ["local", "admin"]:
+                self.conn.drop_database(name)
+
+    def tearDown(self):
+        self.connector.join()
+        self.drop_all_databases()
+        self.repl_set.stop()
+
+
+class TestMongoReplicaSetSingle(MongoReplicaSetTestCase):
+    """ Tests MongoDB to MongoDB DocManager replication with a 1 node replica
+    set.
+    """
+
+    replica_set_class = ReplicaSetSingle
 
     def test_insert(self):
         """Tests insert
@@ -204,6 +211,63 @@ class TestMongo(MongoTestCase):
 
         # Update whole document
         check_update({"a": 0, "b": {"1": {"d": 10000}}})
+
+    def check_renamed_insert(self, target_coll):
+        target_db, target_coll = target_coll.split('.', 1)
+        mongo_target = self.mongo_conn[target_db][target_coll]
+        assert_soon(lambda: len(list(mongo_target.find({}))))
+        target_docs = list(mongo_target.find({}))
+        self.assertEqual(len(target_docs), 1)
+        self.assertEqual(target_docs[0]["renamed"], 1)
+
+    def create_renamed_collection(self, source_coll, target_coll):
+        """Create renamed collections for the command tests."""
+        # Create the rename database and 'rename.me' collection
+        source_db, source_coll = source_coll.split('.', 1)
+        mongo_source = self.conn[source_db][source_coll]
+        mongo_source.insert_one({"renamed": 1})
+        self.check_renamed_insert(target_coll)
+
+    def test_drop_database_renamed(self):
+        """Test the dropDatabase command on a renamed database."""
+        self.create_renamed_collection("rename.me", "new.target")
+        self.create_renamed_collection("rename.me2", "new2.target2")
+        # test that drop database removes target databases
+        self.conn.drop_database("rename")
+        assert_soon(lambda: "new" not in self.mongo_conn.database_names())
+        assert_soon(lambda: "new2" not in self.mongo_conn.database_names())
+
+    def test_drop_collection_renamed(self):
+        """Test the drop collection command on a renamed collection."""
+        self.create_renamed_collection("rename.me", "new.target")
+        self.create_renamed_collection("rename.me2", "new2.target2")
+        # test that drop collection removes target collection
+        self.conn.rename.drop_collection("me")
+        assert_soon(
+            lambda: "target" not in self.mongo_conn.new.collection_names())
+        self.conn.rename.drop_collection("me2")
+        assert_soon(
+            lambda: "target2" not in self.mongo_conn.new2.collection_names())
+
+    def test_rename_collection_renamed(self):
+        """Test the renameCollection command on a renamed collection to a
+        renamed collection.
+        """
+        self.create_renamed_collection("rename.me", "new.target")
+        self.conn.admin.command(
+            "renameCollection", "rename.me", to="rename.me2")
+        # In the target, 'new.target' should be renamed to 'new2.target2'
+        assert_soon(
+            lambda: "target" not in self.mongo_conn.new.collection_names())
+        self.check_renamed_insert("new2.target2")
+
+
+class TestMongoReplicaSet(MongoReplicaSetTestCase):
+    """ Tests MongoDB to MongoDB DocManager replication with a 3 node replica
+    set.
+    """
+
+    replica_set_class = ReplicaSet
 
     def test_rollback(self):
         """Tests rollback. We force a rollback by adding a doc, killing the

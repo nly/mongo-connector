@@ -25,7 +25,7 @@ from bson.timestamp import Timestamp
 sys.path[0:0] = [""]
 
 from mongo_connector.connector import Connector
-from mongo_connector.test_utils import ReplicaSet, connector_opts
+from mongo_connector.test_utils import ReplicaSetSingle, connector_opts
 from mongo_connector.util import long_to_bson_ts
 from tests import unittest
 
@@ -43,7 +43,7 @@ class TestMongoConnector(unittest.TestCase):
         except OSError:
             pass
         open("oplog.timestamp", "w").close()
-        cls.repl_set = ReplicaSet().start()
+        cls.repl_set = ReplicaSetSingle().start()
 
     @classmethod
     def tearDownClass(cls):
@@ -56,7 +56,6 @@ class TestMongoConnector(unittest.TestCase):
         """
         conn = Connector(
             mongo_address=self.repl_set.uri,
-            ns_set=['test.test'],
             **connector_opts
         )
         conn.start()
@@ -81,25 +80,24 @@ class TestMongoConnector(unittest.TestCase):
         conn = Connector(
             mongo_address=self.repl_set.uri,
             oplog_checkpoint="temp_oplog.timestamp",
-            ns_set=['test.test'],
             **connector_opts
         )
 
-        #test that None is returned if there is no config file specified.
+        # test that None is returned if there is no config file specified.
         self.assertEqual(conn.write_oplog_progress(), None)
 
         conn.oplog_progress.get_dict()[1] = Timestamp(12, 34)
-        #pretend to insert a thread/timestamp pair
+        # pretend to insert a thread/timestamp pair
         conn.write_oplog_progress()
 
         data = json.load(open("temp_oplog.timestamp", 'r'))
         self.assertEqual(1, int(data[0]))
         self.assertEqual(long_to_bson_ts(int(data[1])), Timestamp(12, 34))
 
-        #ensure the temp file was deleted
+        # ensure the temp file was deleted
         self.assertFalse(os.path.exists("temp_oplog.timestamp" + '~'))
 
-        #ensure that updates work properly
+        # ensure that updates work properly
         conn.oplog_progress.get_dict()[1] = Timestamp(44, 22)
         conn.write_oplog_progress()
 
@@ -118,11 +116,10 @@ class TestMongoConnector(unittest.TestCase):
         conn = Connector(
             mongo_address=self.repl_set.uri,
             oplog_checkpoint=None,
-            ns_set=['test.test'],
             **connector_opts
         )
 
-        #testing with no file
+        # testing with no file
         self.assertEqual(conn.read_oplog_progress(), None)
 
         try:
@@ -133,12 +130,12 @@ class TestMongoConnector(unittest.TestCase):
 
         conn.oplog_checkpoint = "temp_oplog.timestamp"
 
-        #testing with empty file
+        # testing with empty file
         self.assertEqual(conn.read_oplog_progress(), None)
 
         oplog_dict = conn.oplog_progress.get_dict()
 
-        #add a value to the file, delete the dict, and then read in the value
+        # add a value to the file, delete the dict, and then read in the value
         oplog_dict['oplog1'] = Timestamp(12, 34)
         conn.write_oplog_progress()
         del oplog_dict['oplog1']
@@ -153,7 +150,7 @@ class TestMongoConnector(unittest.TestCase):
 
         oplog_dict['oplog1'] = Timestamp(55, 11)
 
-        #see if oplog progress dict is properly updated
+        # see if oplog progress dict is properly updated
         conn.read_oplog_progress()
         self.assertTrue(oplog_dict['oplog1'], Timestamp(55, 11))
 

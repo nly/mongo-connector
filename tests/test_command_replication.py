@@ -21,18 +21,21 @@ sys.path[0:0] = [""]
 
 import pymongo
 
-from mongo_connector import errors
+from mongo_connector.namespace_config import NamespaceConfig
 from mongo_connector.command_helper import CommandHelper
 from mongo_connector.doc_managers.doc_manager_base import DocManagerBase
 from mongo_connector.locking_dict import LockingDict
 from mongo_connector.oplog_manager import OplogThread
-from mongo_connector.test_utils import ReplicaSet, assert_soon, close_client
+from mongo_connector.test_utils import (assert_soon,
+                                        close_client,
+                                        ReplicaSetSingle)
 from tests import unittest
 
 
 class CommandLoggerDocManager(DocManagerBase):
     def __init__(self, url=None, **kwargs):
         self.commands = []
+        self.command_helper = None
 
     def stop(self):
         pass
@@ -47,12 +50,33 @@ class CommandLoggerDocManager(DocManagerBase):
         pass
 
     def handle_command(self, doc, namespace, timestamp):
-        self.commands.append(doc)
+        db, _ = namespace.split('.', 1)
+        if doc.get('dropDatabase'):
+            if self.command_helper.map_db(db):
+                self.commands.append(doc)
+
+        if doc.get('renameCollection'):
+            a = self.command_helper.map_namespace(doc['renameCollection'])
+            b = self.command_helper.map_namespace(doc['to'])
+            if a and b:
+                self.commands.append(doc)
+
+        if doc.get('create'):
+            new_db, coll = self.command_helper.map_collection(
+                db, doc['create'])
+            if new_db:
+                self.commands.append(doc)
+
+        if doc.get('drop'):
+            new_db, coll = self.command_helper.map_collection(
+                db, doc['drop'])
+            if new_db:
+                self.commands.append(doc)
 
 
 class TestCommandReplication(unittest.TestCase):
     def setUp(self):
-        self.repl_set = ReplicaSet().start()
+        self.repl_set = ReplicaSetSingle().start()
         self.primary_conn = self.repl_set.client()
         self.oplog_progress = LockingDict()
         self.opman = None
@@ -66,34 +90,29 @@ class TestCommandReplication(unittest.TestCase):
         close_client(self.primary_conn)
         self.repl_set.stop()
 
-    def initOplogThread(self, namespace_set=[], dest_mapping={}):
+    def initOplogThread(self, namespace_set=None):
         self.docman = CommandLoggerDocManager()
-        self.docman.command_helper = CommandHelper(namespace_set, dest_mapping)
+        namespace_config = NamespaceConfig(namespace_set=namespace_set)
+
+        self.docman.command_helper = CommandHelper(namespace_config)
         self.opman = OplogThread(
             primary_client=self.primary_conn,
             doc_managers=(self.docman,),
             oplog_progress_dict=self.oplog_progress,
-            ns_set=namespace_set,
-            dest_mapping=dest_mapping,
+            namespace_config=namespace_config,
             collection_dump=False
         )
         self.opman.start()
 
     def test_command_helper(self):
-        # Databases cannot be merged
-        mapping = {
-            'a.x': 'c.x',
-            'b.x': 'c.y'
-        }
-        self.assertRaises(errors.MongoConnectorError,
-                          CommandHelper,
-                          list(mapping), mapping)
 
         mapping = {
             'a.x': 'b.x',
             'a.y': 'c.y'
         }
-        helper = CommandHelper(list(mapping) + ['a.z'], mapping)
+
+        helper = CommandHelper(NamespaceConfig(
+            namespace_set=list(mapping) + ['a.z'], namespace_options=mapping))
 
         self.assertEqual(set(helper.map_db('a')), set(['a', 'b', 'c']))
         self.assertEqual(helper.map_db('d'), [])
@@ -111,7 +130,8 @@ class TestCommandReplication(unittest.TestCase):
         pymongo.collection.Collection(
             self.primary_conn['test'], 'test', create=True)
         assert_soon(lambda: self.docman.commands)
-        self.assertEqual(self.docman.commands[0], {'create': 'test'})
+        command = self.docman.commands[0]
+        self.assertEqual(command['create'], 'test')
 
     def test_create_collection_skipped(self):
         self.initOplogThread(['test.test'])
@@ -123,7 +143,8 @@ class TestCommandReplication(unittest.TestCase):
 
         assert_soon(lambda: self.docman.commands)
         self.assertEqual(len(self.docman.commands), 1)
-        self.assertEqual(self.docman.commands[0], {'create': 'test'})
+        command = self.docman.commands[0]
+        self.assertEqual(command['create'], 'test')
 
     def test_drop_collection(self):
         self.initOplogThread()
@@ -153,7 +174,6 @@ class TestCommandReplication(unittest.TestCase):
         self.assertEqual(
             self.docman.commands[1].get('to'),
             'test.test2')
-
 
 
 if __name__ == '__main__':
